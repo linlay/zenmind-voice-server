@@ -1,0 +1,13 @@
+.git
+.gitignore
+.DS_Store
+.idea
+.vscode
+bin
+*.log
+*.out
+*.coverprofile
+.env
+frontend/node_modules
+frontend/dist
+frontend/tsconfig.tsbuildinfo

@@ -1,0 +1,1390 @@
+import { useEffect, useMemo, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
+import { PcmQueuePlayer } from './audio/PcmQueuePlayer';
+import { encodePcm16 } from './audio/pcm';
+import { useVoiceSocket, type ConnectionStatus } from './useVoiceSocket';
+
+type ViewMode = 'test' | 'qa';
+
+type VoiceOption = {
+  id: string;
+  displayName: string;
+  provider: string;
+  default: boolean;
+};
+
+type Status = 'READY' | 'CONNECTING' | 'STREAMING' | 'STOPPED' | 'ERROR';
+type QaStatus = 'IDLE' | 'STARTING' | 'LISTENING' | 'THINKING' | 'SPEAKING' | 'ERROR';
+type CaptureOwner = 'test' | 'qa' | null;
+
+type ServerEvent = {
+  type: string;
+  sessionId?: string;
+  taskId?: string;
+  taskType?: string;
+  chatId?: string;
+  mode?: 'local' | 'llm';
+  reason?: string;
+  code?: string;
+  message?: string;
+  text?: string;
+  voice?: string;
+  voiceDisplayName?: string;
+  sampleRate?: number;
+  channels?: number;
+  seq?: number;
+  byteLength?: number;
+};
+
+type CapabilitiesResponse = {
+  websocketPath?: string;
+  asr?: {
+    configured?: boolean;
+    defaults?: {
+      sampleRate?: number;
+      language?: string;
+      turnDetection?: {
+        type?: string;
+        threshold?: number;
+        silenceDurationMs?: number;
+      };
+    };
+  };
+  tts?: {
+    modes?: string[];
+    defaultMode?: 'local' | 'llm';
+    runnerConfigured?: boolean;
+    speechRateDefault?: number;
+    audioFormat?: {
+      sampleRate?: number;
+      channels?: number;
+    };
+  };
+};
+
+type AudioCaptureRefs = {
+  streamRef: MutableRefObject<MediaStream | null>;
+  audioContextRef: MutableRefObject<AudioContext | null>;
+  sourceRef: MutableRefObject<MediaStreamAudioSourceNode | null>;
+  processorRef: MutableRefObject<ScriptProcessorNode | null>;
+  captureStartedRef: MutableRefObject<boolean>;
+  remainRef: MutableRefObject<Uint8Array>;
+};
+
+type PendingBinary = {
+  taskId: string;
+  seq: number;
+};
+
+type TtsAudioSummary = {
+  chunks: number;
+  bytes: number;
+  startedAt: number;
+  receivingLogged: boolean;
+};
+
+const FRAME_BYTES = 640;
+const QA_SEND_PAUSE_DEFAULT_SECONDS = 1.5;
+const QA_SEND_PAUSE_MIN_SECONDS = 0.5;
+const QA_SEND_PAUSE_MAX_SECONDS = 10.0;
+const TEST_ASR_TASK_ID = 'asr-test';
+const TEST_TTS_TASK_ID = 'tts-test';
+const QA_ASR_TASK_ID = 'qa-asr';
+const QA_TTS_TASK_ID = 'qa-tts';
+
+function isLocalDevHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+}
+
+function resolveDefaultWsUrl(): string {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const { hostname, port, host } = window.location;
+  if (isLocalDevHost(hostname) && port === '5173') {
+    return `${protocol}//${hostname}:11953/api/voice/ws`;
+  }
+  return `${protocol}//${host}/api/voice/ws`;
+}
+
+function resolveWsUrl(raw: string): string {
+  if (raw.trim()) {
+    return raw.trim();
+  }
+  return resolveDefaultWsUrl();
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function cleanupAudioCapture(refs: AudioCaptureRefs) {
+  refs.captureStartedRef.current = false;
+  if (refs.processorRef.current) {
+    refs.processorRef.current.disconnect();
+    refs.processorRef.current.onaudioprocess = null;
+    refs.processorRef.current = null;
+  }
+  if (refs.sourceRef.current) {
+    refs.sourceRef.current.disconnect();
+    refs.sourceRef.current = null;
+  }
+  if (refs.audioContextRef.current) {
+    void refs.audioContextRef.current.close();
+    refs.audioContextRef.current = null;
+  }
+  if (refs.streamRef.current) {
+    refs.streamRef.current.getTracks().forEach((track) => track.stop());
+    refs.streamRef.current = null;
+  }
+  refs.remainRef.current = new Uint8Array(0);
+}
+
+function emitChunkedAudio(
+  bytes: Uint8Array,
+  remainRef: MutableRefObject<Uint8Array>,
+  onChunk: (chunk: Uint8Array) => void
+) {
+  const merged = new Uint8Array(remainRef.current.length + bytes.length);
+  merged.set(remainRef.current, 0);
+  merged.set(bytes, remainRef.current.length);
+
+  let offset = 0;
+  while (offset + FRAME_BYTES <= merged.length) {
+    onChunk(merged.slice(offset, offset + FRAME_BYTES));
+    offset += FRAME_BYTES;
+  }
+  remainRef.current = merged.slice(offset);
+}
+
+async function initializeAudioCapture(
+  refs: AudioCaptureRefs,
+  onChunk: (chunk: Uint8Array) => void,
+  onStarted: () => void,
+  onError: (message: string) => void
+) {
+  if (refs.captureStartedRef.current) {
+    return;
+  }
+  refs.captureStartedRef.current = true;
+
+  try {
+    const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    refs.streamRef.current = mediaStream;
+
+    const AudioContextCtor =
+      window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (AudioContextCtor == null) {
+      throw new Error('当前浏览器不支持 AudioContext');
+    }
+
+    const audioContext = new AudioContextCtor();
+    refs.audioContextRef.current = audioContext;
+
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    refs.sourceRef.current = source;
+
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    refs.processorRef.current = processor;
+
+    processor.onaudioprocess = (event) => {
+      if (!refs.captureStartedRef.current) {
+        return;
+      }
+      const input = event.inputBuffer.getChannelData(0);
+      const pcm16 = encodePcm16(input, audioContext.sampleRate, 16000);
+      emitChunkedAudio(new Uint8Array(pcm16.buffer), refs.remainRef, onChunk);
+    };
+
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+    onStarted();
+  } catch (error) {
+    cleanupAudioCapture(refs);
+    onError(`麦克风初始化失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function statusClass(status: Status | ConnectionStatus): string {
+  return `status ${status.toLowerCase()}`;
+}
+
+function qaStatusClass(status: QaStatus): string {
+  return `status ${status.toLowerCase()}`;
+}
+
+function isTaskActive(status: Status): boolean {
+  return status === 'CONNECTING' || status === 'STREAMING';
+}
+
+function formatByteSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+function clampSpeechRate(rate: number): number {
+  if (Number.isNaN(rate)) {
+    return 1.2;
+  }
+  return Math.max(0.5, Math.min(2.0, rate));
+}
+
+function clampQaSendPauseSeconds(seconds: number): number {
+  if (Number.isNaN(seconds)) {
+    return QA_SEND_PAUSE_DEFAULT_SECONDS;
+  }
+  return Math.max(QA_SEND_PAUSE_MIN_SECONDS, Math.min(QA_SEND_PAUSE_MAX_SECONDS, seconds));
+}
+
+function mergeQaUtterance(current: string, next: string): string {
+  const left = current.trimEnd();
+  const right = next.trimStart();
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  const needsSpace = /[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right);
+  return `${left}${needsSpace ? ' ' : ''}${right}`;
+}
+
+function normalizeQaUtteranceForLength(text: string): string {
+  return text
+    .trim()
+    .replace(
+      /[\s\u3000!"#$%&'()*+,./:;<=>?@[\\\]^_`{|}~\-，。！？、；：,.·!?"“”'‘’（）()【】《》〈〉「」『』…—]+/g,
+      ''
+    );
+}
+
+export default function App() {
+  const [wsUrlInput, setWsUrlInput] = useState(() => resolveDefaultWsUrl());
+  const [viewMode, setViewMode] = useState<ViewMode>('test');
+  const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
+  const [selectedVoice, setSelectedVoice] = useState('Cherry');
+  const [ttsSpeechRate, setTtsSpeechRate] = useState(1.2);
+
+  const [testAsrStatus, setTestAsrStatus] = useState<Status>('READY');
+  const [testAsrError, setTestAsrError] = useState('');
+  const [testAsrPartial, setTestAsrPartial] = useState('');
+  const [testAsrFinalLines, setTestAsrFinalLines] = useState<string[]>([]);
+  const [testAsrLogs, setTestAsrLogs] = useState<string[]>([]);
+
+  const [testTtsStatus, setTestTtsStatus] = useState<Status>('READY');
+  const [testTtsError, setTestTtsError] = useState('');
+  const [testTtsText, setTestTtsText] = useState('你好，欢迎来到统一语音服务控制台。');
+  const [testTtsRenderedText, setTestTtsRenderedText] = useState('');
+  const [testTtsLogs, setTestTtsLogs] = useState<string[]>([]);
+  const [testTtsSampleRate, setTestTtsSampleRate] = useState(24000);
+  const [testTtsChannels, setTestTtsChannels] = useState(1);
+
+  const [qaStatus, setQaStatus] = useState<QaStatus>('IDLE');
+  const [qaError, setQaError] = useState('');
+  const [qaNotice, setQaNotice] = useState('');
+  const [qaLatestUtterance, setQaLatestUtterance] = useState('');
+  const [qaAssistantResponse, setQaAssistantResponse] = useState('');
+  const [qaLogs, setQaLogs] = useState<string[]>([]);
+  const [qaSessionActive, setQaSessionActive] = useState(false);
+  const [qaChatId, setQaChatId] = useState('');
+  const [qaSendPauseSeconds, setQaSendPauseSeconds] = useState(QA_SEND_PAUSE_DEFAULT_SECONDS);
+  const [qaTtsSampleRate, setQaTtsSampleRate] = useState(24000);
+  const [qaTtsChannels, setQaTtsChannels] = useState(1);
+  const [qaMicPaused, setQaMicPaused] = useState(false);
+
+  const playerRef = useRef(new PcmQueuePlayer());
+  const pendingBinaryRef = useRef<PendingBinary[]>([]);
+  const ttsAudioSummaryRef = useRef<Record<string, TtsAudioSummary>>({});
+
+  const qaSessionActiveRef = useRef(false);
+  const qaAwaitingUserRef = useRef(false);
+  const qaChatIdRef = useRef('');
+  const qaAcceptChatUpdatesRef = useRef(true);
+  const qaPendingUtteranceRef = useRef('');
+  const qaSendTimerRef = useRef<number | null>(null);
+  const captureOwnerRef = useRef<CaptureOwner>(null);
+  const captureTaskIdRef = useRef<string | null>(null);
+  const capturePausedRef = useRef(false);
+
+  const testAsrStatusRef = useRef<Status>('READY');
+  const testTtsStatusRef = useRef<Status>('READY');
+  const qaAsrStatusRef = useRef<Status>('READY');
+  const qaTtsStatusRef = useRef<Status>('READY');
+  const qaStatusRef = useRef<QaStatus>('IDLE');
+
+  const asrStreamRef = useRef<MediaStream | null>(null);
+  const asrAudioContextRef = useRef<AudioContext | null>(null);
+  const asrSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const asrProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const asrCaptureStartedRef = useRef(false);
+  const asrRemainRef = useRef(new Uint8Array(0));
+
+  const asrAudioRefs: AudioCaptureRefs = {
+    streamRef: asrStreamRef,
+    audioContextRef: asrAudioContextRef,
+    sourceRef: asrSourceRef,
+    processorRef: asrProcessorRef,
+    captureStartedRef: asrCaptureStartedRef,
+    remainRef: asrRemainRef
+  };
+
+  const wsUrl = useMemo(() => resolveWsUrl(wsUrlInput), [wsUrlInput]);
+
+  function setTestAsrStatusValue(next: Status) {
+    testAsrStatusRef.current = next;
+    setTestAsrStatus(next);
+  }
+
+  function setTestTtsStatusValue(next: Status) {
+    testTtsStatusRef.current = next;
+    setTestTtsStatus(next);
+  }
+
+  function setQaAsrStatusValue(next: Status) {
+    qaAsrStatusRef.current = next;
+  }
+
+  function setQaTtsStatusValue(next: Status) {
+    qaTtsStatusRef.current = next;
+  }
+
+  function setQaStatusValue(next: QaStatus) {
+    qaStatusRef.current = next;
+    setQaStatus(next);
+  }
+
+  function setQaSessionActiveValue(next: boolean) {
+    qaSessionActiveRef.current = next;
+    setQaSessionActive(next);
+  }
+
+  function setQaChatIdValue(next: string) {
+    qaChatIdRef.current = next;
+    setQaChatId(next);
+  }
+
+  function appendLog(setter: Dispatch<SetStateAction<string[]>>, line: string) {
+    const timestamped = `${new Date().toLocaleTimeString()} ${line}`;
+    setter((prev) => [...prev, timestamped].slice(-200));
+  }
+
+  function appendTestAsrLog(line: string) {
+    appendLog(setTestAsrLogs, line);
+  }
+
+  function appendTestTtsLog(line: string) {
+    appendLog(setTestTtsLogs, line);
+  }
+
+  function appendQaLog(line: string) {
+    appendLog(setQaLogs, line);
+  }
+
+  function resetTtsAudioSummary(taskId: string) {
+    ttsAudioSummaryRef.current[taskId] = {
+      chunks: 0,
+      bytes: 0,
+      startedAt: Date.now(),
+      receivingLogged: false
+    };
+  }
+
+  function trackTtsChunk(taskId: string, byteLength: number, onFirstChunk: () => void) {
+    const current = ttsAudioSummaryRef.current[taskId] ?? {
+      chunks: 0,
+      bytes: 0,
+      startedAt: Date.now(),
+      receivingLogged: false
+    };
+    current.chunks += 1;
+    current.bytes += byteLength;
+    if (!current.receivingLogged) {
+      current.receivingLogged = true;
+      onFirstChunk();
+    }
+    ttsAudioSummaryRef.current[taskId] = current;
+  }
+
+  function flushTtsSummary(taskId: string, appendSummary: (line: string) => void) {
+    const summary = ttsAudioSummaryRef.current[taskId];
+    if (summary == null || summary.chunks === 0) {
+      delete ttsAudioSummaryRef.current[taskId];
+      return;
+    }
+    appendSummary(
+      `audio complete: ${summary.chunks} chunks, ${formatByteSize(summary.bytes)}, ${formatDuration(Date.now() - summary.startedAt)}`
+    );
+    delete ttsAudioSummaryRef.current[taskId];
+  }
+
+  function resetTestTtsView() {
+    setTestTtsError('');
+    setTestTtsRenderedText('');
+  }
+
+  function resetQaConversationView() {
+    setQaError('');
+    setQaNotice('');
+    setQaLatestUtterance('');
+    setQaAssistantResponse('');
+    setQaLogs([]);
+  }
+
+  function resetQaChatContext() {
+    setQaChatIdValue('');
+  }
+
+  function clearQaSendTimer() {
+    if (qaSendTimerRef.current != null) {
+      window.clearTimeout(qaSendTimerRef.current);
+      qaSendTimerRef.current = null;
+    }
+  }
+
+  function clearQaPendingUtterance() {
+    clearQaSendTimer();
+    qaPendingUtteranceRef.current = '';
+  }
+
+  function flushQaPendingUtterance() {
+    clearQaSendTimer();
+
+    const mergedText = qaPendingUtteranceRef.current.trim();
+    if (!mergedText) {
+      qaPendingUtteranceRef.current = '';
+      return;
+    }
+    if (!qaSessionActiveRef.current || !qaAwaitingUserRef.current || isTaskActive(qaTtsStatusRef.current)) {
+      qaPendingUtteranceRef.current = '';
+      return;
+    }
+
+    const normalizedLength = normalizeQaUtteranceForLength(mergedText).length;
+    qaPendingUtteranceRef.current = '';
+
+    if (normalizedLength <= 2) {
+      appendQaLog(`[ASR skipped] utterance too short (${normalizedLength} chars): ${mergedText}`);
+      setQaStatusValue('LISTENING');
+      return;
+    }
+
+    qaAwaitingUserRef.current = false;
+    setQaAssistantResponse('');
+    setQaStatusValue('THINKING');
+    startQaTts(mergedText);
+  }
+
+  function scheduleQaPendingUtteranceFlush() {
+    clearQaSendTimer();
+    qaSendTimerRef.current = window.setTimeout(() => {
+      qaSendTimerRef.current = null;
+      flushQaPendingUtterance();
+    }, qaSendPauseSeconds * 1000);
+  }
+
+  function resetAllAudioCaptureState() {
+    cleanupAudioCapture(asrAudioRefs);
+    captureOwnerRef.current = null;
+    captureTaskIdRef.current = null;
+    capturePausedRef.current = false;
+    setQaMicPaused(false);
+  }
+
+  const { status: connectionStatus, sendJson, reconnect } = useVoiceSocket(wsUrl, {
+    onJsonMessage: (rawMessage) => {
+      const message = rawMessage as ServerEvent;
+
+      if (message.taskId === TEST_ASR_TASK_ID) {
+        appendTestAsrLog(`[${message.type}] ${message.text ?? message.reason ?? message.message ?? ''}`.trim());
+
+        if (message.type === 'task.started') {
+          void ensureAudioCaptureFor(TEST_ASR_TASK_ID, 'test');
+          return;
+        }
+        if (message.type === 'asr.text.delta' && message.text) {
+          setTestAsrPartial((prev) => `${prev}${message.text}`);
+          return;
+        }
+        if (message.type === 'asr.text.final' && message.text) {
+          const finalText = message.text;
+          setTestAsrFinalLines((prev) => [...prev, finalText]);
+          setTestAsrPartial('');
+          return;
+        }
+        if (message.type === 'error') {
+          setTestAsrError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
+          setTestAsrStatusValue('ERROR');
+          if (captureTaskIdRef.current === TEST_ASR_TASK_ID) {
+            resetAllAudioCaptureState();
+          }
+          return;
+        }
+        if (message.type === 'task.stopped') {
+          if (captureTaskIdRef.current === TEST_ASR_TASK_ID) {
+            resetAllAudioCaptureState();
+          }
+          if (testAsrStatusRef.current !== 'ERROR') {
+            setTestAsrStatusValue('STOPPED');
+          }
+          return;
+        }
+      }
+
+      if (message.taskId === QA_ASR_TASK_ID) {
+        if (message.type !== 'asr.text.delta') {
+          appendQaLog(`[ASR ${message.type}] ${message.text ?? message.reason ?? message.message ?? ''}`.trim());
+        }
+
+        if (message.type === 'task.started') {
+          setQaAsrStatusValue('STREAMING');
+          if (!capturePausedRef.current) {
+            void ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
+          } else {
+            setQaStatusValue('SPEAKING');
+          }
+          if (qaSessionActiveRef.current && qaStatusRef.current === 'STARTING') {
+            qaAwaitingUserRef.current = true;
+            setQaStatusValue('LISTENING');
+            setQaNotice('');
+          }
+          return;
+        }
+        if (message.type === 'asr.text.final' && message.text) {
+          if (qaSessionActiveRef.current && qaAwaitingUserRef.current && !isTaskActive(qaTtsStatusRef.current)) {
+            const mergedText = mergeQaUtterance(qaPendingUtteranceRef.current, message.text);
+            qaPendingUtteranceRef.current = mergedText;
+            setQaLatestUtterance(mergedText);
+            scheduleQaPendingUtteranceFlush();
+          }
+          return;
+        }
+        if (message.type === 'error') {
+          clearQaPendingUtterance();
+          resetQaChatContext();
+          setQaError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
+          setQaStatusValue('ERROR');
+          setQaSessionActiveValue(false);
+          qaAwaitingUserRef.current = false;
+          setQaAsrStatusValue('ERROR');
+          if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
+            resetAllAudioCaptureState();
+          }
+          return;
+        }
+        if (message.type === 'task.stopped') {
+          clearQaPendingUtterance();
+          resetQaChatContext();
+          if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
+            resetAllAudioCaptureState();
+          }
+          setQaAsrStatusValue('STOPPED');
+          qaAwaitingUserRef.current = false;
+          if (qaSessionActiveRef.current) {
+            setQaSessionActiveValue(false);
+            setQaNotice('QA 会话已停止。');
+          }
+          if (qaStatusRef.current !== 'ERROR') {
+            setQaStatusValue('IDLE');
+          }
+        }
+        return;
+      }
+
+      if (message.taskId === TEST_TTS_TASK_ID) {
+        if (message.type !== 'tts.audio.chunk') {
+          appendTestTtsLog(`[${message.type}] ${message.text ?? message.reason ?? message.message ?? ''}`.trim());
+        }
+
+        if (message.type === 'task.started') {
+          setTestTtsStatusValue('STREAMING');
+          setQaTtsStatusValue('READY');
+          pendingBinaryRef.current = [];
+          resetTtsAudioSummary(TEST_TTS_TASK_ID);
+          return;
+        }
+        if (message.type === 'tts.audio.format') {
+          if (typeof message.sampleRate === 'number') {
+            setTestTtsSampleRate(message.sampleRate);
+          }
+          if (typeof message.channels === 'number') {
+            setTestTtsChannels(message.channels);
+          }
+          return;
+        }
+        if (message.type === 'tts.audio.chunk') {
+          pendingBinaryRef.current.push({ taskId: TEST_TTS_TASK_ID, seq: message.seq ?? 0 });
+          trackTtsChunk(TEST_TTS_TASK_ID, message.byteLength ?? 0, () => appendTestTtsLog('receiving audio...'));
+          return;
+        }
+        if (message.type === 'tts.done' && testTtsStatusRef.current !== 'ERROR') {
+          setTestTtsStatusValue('STOPPED');
+          return;
+        }
+        if (message.type === 'error') {
+          setTestTtsError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
+          setTestTtsStatusValue('ERROR');
+          flushTtsSummary(TEST_TTS_TASK_ID, appendTestTtsLog);
+          return;
+        }
+        if (message.type === 'task.stopped') {
+          if (testTtsStatusRef.current !== 'ERROR') {
+            setTestTtsStatusValue('STOPPED');
+          }
+          flushTtsSummary(TEST_TTS_TASK_ID, appendTestTtsLog);
+        }
+        return;
+      }
+
+      if (message.taskId === QA_TTS_TASK_ID) {
+        if (message.type !== 'tts.audio.chunk') {
+          appendQaLog(`[TTS ${message.type}] ${message.text ?? message.reason ?? message.message ?? ''}`.trim());
+        }
+
+        if (message.type === 'task.started') {
+          clearQaPendingUtterance();
+          setQaTtsStatusValue('STREAMING');
+          pendingBinaryRef.current = [];
+          resetTtsAudioSummary(QA_TTS_TASK_ID);
+          pauseQaAudioCapture();
+          setQaStatusValue('SPEAKING');
+          return;
+        }
+        if (message.type === 'tts.audio.format') {
+          if (typeof message.sampleRate === 'number') {
+            setQaTtsSampleRate(message.sampleRate);
+          }
+          if (typeof message.channels === 'number') {
+            setQaTtsChannels(message.channels);
+          }
+          return;
+        }
+        if (message.type === 'tts.audio.chunk') {
+          pendingBinaryRef.current.push({ taskId: QA_TTS_TASK_ID, seq: message.seq ?? 0 });
+          trackTtsChunk(QA_TTS_TASK_ID, message.byteLength ?? 0, () => appendQaLog('Receiving audio...'));
+          return;
+        }
+        if (message.type === 'tts.text.delta' && message.text) {
+          setQaAssistantResponse((prev) => `${prev}${message.text}`);
+          return;
+        }
+        if (message.type === 'tts.chat.updated' && message.chatId) {
+          if (!qaAcceptChatUpdatesRef.current) {
+            return;
+          }
+          setQaChatIdValue(message.chatId);
+          return;
+        }
+        if (message.type === 'tts.done' && qaTtsStatusRef.current !== 'ERROR') {
+          setQaTtsStatusValue('STOPPED');
+          return;
+        }
+        if (message.type === 'error') {
+          clearQaPendingUtterance();
+          resetQaChatContext();
+          setQaError(`${message.code ?? 'ERROR'}: ${message.message ?? 'unknown error'}`);
+          setQaStatusValue('ERROR');
+          setQaTtsStatusValue('ERROR');
+          setQaSessionActiveValue(false);
+          qaAwaitingUserRef.current = false;
+          flushTtsSummary(QA_TTS_TASK_ID, appendQaLog);
+          return;
+        }
+        if (message.type === 'task.stopped') {
+          flushTtsSummary(QA_TTS_TASK_ID, appendQaLog);
+          if (qaTtsStatusRef.current !== 'ERROR') {
+            setQaTtsStatusValue('STOPPED');
+          }
+          void resumeQaAudioCapture().then(() => {
+            if (!qaSessionActiveRef.current) {
+              return;
+            }
+            qaAwaitingUserRef.current = true;
+            setQaStatusValue('LISTENING');
+            setQaNotice('');
+          });
+        }
+      }
+    },
+    onBinaryMessage: async (buffer) => {
+      const pending = pendingBinaryRef.current.shift();
+      if (pending == null) {
+        return;
+      }
+
+      if (pending.taskId === TEST_TTS_TASK_ID) {
+        await playerRef.current.enqueue(buffer, testTtsSampleRate, testTtsChannels);
+        return;
+      }
+
+      if (pending.taskId === QA_TTS_TASK_ID) {
+        await playerRef.current.enqueue(buffer, qaTtsSampleRate, qaTtsChannels);
+      }
+    },
+    onOpen: () => {
+      appendTestAsrLog(`connection open: ${wsUrl}`);
+      appendTestTtsLog(`connection open: ${wsUrl}`);
+      appendQaLog(`connection open: ${wsUrl}`);
+    },
+    onClose: () => {
+      clearQaPendingUtterance();
+      resetQaChatContext();
+      resetAllAudioCaptureState();
+      pendingBinaryRef.current = [];
+      playerRef.current.stopAll();
+      setQaSessionActiveValue(false);
+      qaAwaitingUserRef.current = false;
+
+      if (isTaskActive(testAsrStatusRef.current)) {
+        setTestAsrStatusValue('STOPPED');
+      }
+      if (isTaskActive(testTtsStatusRef.current)) {
+        setTestTtsStatusValue('STOPPED');
+      }
+      if (isTaskActive(qaTtsStatusRef.current) || isTaskActive(qaAsrStatusRef.current)) {
+        setQaStatusValue('IDLE');
+      }
+      setQaAsrStatusValue('STOPPED');
+      setQaTtsStatusValue('STOPPED');
+    },
+    onError: () => {
+      setTestAsrError((prev) => prev || 'WebSocket 连接异常');
+      setTestTtsError((prev) => prev || 'WebSocket 连接异常');
+      setQaError((prev) => prev || 'WebSocket 连接异常');
+    }
+  });
+
+  async function ensureAudioCaptureFor(taskId: string, owner: Exclude<CaptureOwner, null>) {
+    if (capturePausedRef.current) {
+      return;
+    }
+    captureOwnerRef.current = owner;
+    captureTaskIdRef.current = taskId;
+
+    await initializeAudioCapture(
+      asrAudioRefs,
+      (chunk) => {
+        sendJson({
+          type: 'asr.audio.append',
+          taskId,
+          audio: bytesToBase64(chunk)
+        });
+      },
+      () => {
+        if (owner === 'test') {
+          setTestAsrStatusValue('STREAMING');
+          return;
+        }
+        setQaAsrStatusValue('STREAMING');
+        if (qaSessionActiveRef.current && qaStatusRef.current !== 'SPEAKING') {
+          clearQaPendingUtterance();
+          qaAwaitingUserRef.current = true;
+          setQaStatusValue('LISTENING');
+        }
+      },
+      (message) => {
+        if (owner === 'test') {
+          setTestAsrError(message);
+          setTestAsrStatusValue('ERROR');
+          return;
+        }
+        clearQaPendingUtterance();
+        resetQaChatContext();
+        setQaError(message);
+        setQaStatusValue('ERROR');
+        setQaSessionActiveValue(false);
+        qaAwaitingUserRef.current = false;
+      }
+    );
+  }
+
+  function pauseQaAudioCapture() {
+    if (captureOwnerRef.current !== 'qa' || captureTaskIdRef.current !== QA_ASR_TASK_ID || capturePausedRef.current) {
+      return;
+    }
+    cleanupAudioCapture(asrAudioRefs);
+    capturePausedRef.current = true;
+    setQaMicPaused(true);
+  }
+
+  async function resumeQaAudioCapture() {
+    if (!capturePausedRef.current) {
+      return;
+    }
+    await playerRef.current.waitForIdle();
+    capturePausedRef.current = false;
+    setQaMicPaused(false);
+    if (!qaSessionActiveRef.current || !isTaskActive(qaAsrStatusRef.current)) {
+      return;
+    }
+    await ensureAudioCaptureFor(QA_ASR_TASK_ID, 'qa');
+  }
+
+  function stopAsrTask(taskId: string) {
+    if (captureTaskIdRef.current === taskId && asrRemainRef.current.length > 0) {
+      sendJson({
+        type: 'asr.audio.append',
+        taskId,
+        audio: bytesToBase64(asrRemainRef.current)
+      });
+    }
+    sendJson({ type: 'asr.audio.commit', taskId });
+    sendJson({ type: 'asr.stop', taskId });
+    if (captureTaskIdRef.current === taskId) {
+      resetAllAudioCaptureState();
+    }
+  }
+
+  function startTestAsr() {
+    if (connectionStatus !== 'OPEN') {
+      setTestAsrError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      return;
+    }
+
+    setTestAsrError('');
+    setTestAsrPartial('');
+    setTestAsrFinalLines([]);
+    setTestAsrLogs([]);
+    if (captureTaskIdRef.current === TEST_ASR_TASK_ID) {
+      resetAllAudioCaptureState();
+    }
+
+    setTestAsrStatusValue('CONNECTING');
+    sendJson({
+      type: 'asr.start',
+      taskId: TEST_ASR_TASK_ID,
+      sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
+      language: capabilities?.asr?.defaults?.language ?? 'zh',
+      turnDetection: {
+        type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
+        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,
+        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 400
+      }
+    });
+  }
+
+  function stopTestAsr() {
+    stopAsrTask(TEST_ASR_TASK_ID);
+    setTestAsrStatusValue('STOPPED');
+  }
+
+  function startTestTts() {
+    if (connectionStatus !== 'OPEN') {
+      setTestTtsError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      return;
+    }
+    if (testTtsText.trim().length === 0) {
+      setTestTtsError('请输入要测试的文本。');
+      return;
+    }
+
+    resetTestTtsView();
+    setTestTtsLogs([]);
+    setTestTtsStatusValue('CONNECTING');
+    pendingBinaryRef.current = pendingBinaryRef.current.filter((item) => item.taskId !== TEST_TTS_TASK_ID);
+    playerRef.current.stopAll();
+
+    const sent = sendJson({
+      type: 'tts.start',
+      taskId: TEST_TTS_TASK_ID,
+      mode: 'local',
+      text: testTtsText,
+      voice: selectedVoice,
+      speechRate: ttsSpeechRate
+    });
+    if (!sent) {
+      setTestTtsError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      setTestTtsStatusValue('ERROR');
+    }
+  }
+
+  function stopTestTts() {
+    sendJson({ type: 'tts.stop', taskId: TEST_TTS_TASK_ID });
+    pendingBinaryRef.current = pendingBinaryRef.current.filter((item) => item.taskId !== TEST_TTS_TASK_ID);
+    playerRef.current.stopAll();
+    setTestTtsStatusValue('STOPPED');
+  }
+
+  function startQaTts(text: string) {
+    qaAcceptChatUpdatesRef.current = true;
+    setQaTtsStatusValue('CONNECTING');
+    pendingBinaryRef.current = pendingBinaryRef.current.filter((item) => item.taskId !== QA_TTS_TASK_ID);
+    playerRef.current.resetQueue();
+
+    const payload: Record<string, unknown> = {
+      type: 'tts.start',
+      taskId: QA_TTS_TASK_ID,
+      mode: 'llm',
+      text,
+      voice: selectedVoice,
+      speechRate: ttsSpeechRate
+    };
+    if (qaChatIdRef.current) {
+      payload.chatId = qaChatIdRef.current;
+    }
+
+    const sent = sendJson(payload);
+    if (!sent) {
+      setQaError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      setQaStatusValue('ERROR');
+      setQaSessionActiveValue(false);
+      qaAwaitingUserRef.current = false;
+    }
+  }
+
+  function startQa() {
+    if (connectionStatus !== 'OPEN') {
+      setQaError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      return;
+    }
+    if (capabilities?.tts?.runnerConfigured === false) {
+      setQaError('当前后端未配置 runner，QA 模式不可用。');
+      return;
+    }
+
+    resetQaConversationView();
+    resetQaChatContext();
+    qaAcceptChatUpdatesRef.current = true;
+    clearQaPendingUtterance();
+    setQaStatusValue('STARTING');
+    setQaSessionActiveValue(true);
+    qaAwaitingUserRef.current = false;
+    setQaAsrStatusValue('CONNECTING');
+    setQaTtsStatusValue('READY');
+
+    const sent = sendJson({
+      type: 'asr.start',
+      taskId: QA_ASR_TASK_ID,
+      sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
+      language: capabilities?.asr?.defaults?.language ?? 'zh',
+      turnDetection: {
+        type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
+        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,
+        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 400
+      }
+    });
+    if (!sent) {
+      setQaError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
+      setQaStatusValue('ERROR');
+      setQaSessionActiveValue(false);
+      qaAwaitingUserRef.current = false;
+    }
+  }
+
+  function stopQa() {
+    setQaSessionActiveValue(false);
+    qaAwaitingUserRef.current = false;
+    setQaNotice('');
+    qaAcceptChatUpdatesRef.current = true;
+    resetQaChatContext();
+    clearQaPendingUtterance();
+
+    if (isTaskActive(qaTtsStatusRef.current)) {
+      sendJson({ type: 'tts.stop', taskId: QA_TTS_TASK_ID });
+    }
+    pendingBinaryRef.current = pendingBinaryRef.current.filter((item) => item.taskId !== QA_TTS_TASK_ID);
+    playerRef.current.stopAll();
+    flushTtsSummary(QA_TTS_TASK_ID, appendQaLog);
+    setQaTtsStatusValue('STOPPED');
+
+    if (isTaskActive(qaAsrStatusRef.current)) {
+      stopAsrTask(QA_ASR_TASK_ID);
+    } else if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
+      resetAllAudioCaptureState();
+    }
+    setQaAsrStatusValue('STOPPED');
+    setQaStatusValue('IDLE');
+  }
+
+  function startNewQaChat() {
+    qaAcceptChatUpdatesRef.current = false;
+    resetQaChatContext();
+    appendQaLog('[QA] started a new chat context');
+  }
+
+  function handleModeChange(nextMode: ViewMode) {
+    if (nextMode === viewMode) {
+      return;
+    }
+
+    if (viewMode === 'qa' && (qaSessionActiveRef.current || isTaskActive(qaAsrStatusRef.current) || isTaskActive(qaTtsStatusRef.current))) {
+      stopQa();
+    }
+    if (viewMode === 'test') {
+      if (isTaskActive(testAsrStatusRef.current)) {
+        stopTestAsr();
+      }
+      if (isTaskActive(testTtsStatusRef.current)) {
+        stopTestTts();
+      }
+    }
+
+    setViewMode(nextMode);
+  }
+
+  useEffect(() => {
+    fetch('/api/voice/capabilities')
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json() as Promise<CapabilitiesResponse>;
+      })
+      .then((data) => {
+        setCapabilities(data);
+        if (typeof data.tts?.audioFormat?.sampleRate === 'number') {
+          setTestTtsSampleRate(data.tts.audioFormat.sampleRate);
+          setQaTtsSampleRate(data.tts.audioFormat.sampleRate);
+        }
+        if (typeof data.tts?.audioFormat?.channels === 'number') {
+          setTestTtsChannels(data.tts.audioFormat.channels);
+          setQaTtsChannels(data.tts.audioFormat.channels);
+        }
+        if (typeof data.tts?.speechRateDefault === 'number') {
+          setTtsSpeechRate(clampSpeechRate(data.tts.speechRateDefault));
+        }
+        if (typeof data.websocketPath === 'string' && !isLocalDevHost(window.location.hostname)) {
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          setWsUrlInput((current) => current.trim() || `${protocol}//${window.location.host}${data.websocketPath}`);
+        }
+      })
+      .catch((error) => {
+        setTestAsrError(`能力接口加载失败: ${error instanceof Error ? error.message : String(error)}`);
+      });
+
+    fetch('/api/voice/tts/voices')
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((data) => {
+        const nextVoices = Array.isArray(data.voices) ? (data.voices as VoiceOption[]) : [];
+        setVoices(nextVoices);
+        if (typeof data.defaultVoice === 'string' && data.defaultVoice) {
+          setSelectedVoice(data.defaultVoice);
+        }
+      })
+      .catch(() => {
+        setVoices([{ id: 'Cherry', displayName: 'Cherry', provider: 'dashscope', default: true }]);
+      });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearQaPendingUtterance();
+      resetAllAudioCaptureState();
+      playerRef.current.stopAll();
+    };
+  }, []);
+
+  const qaModeUnavailable = capabilities?.tts?.runnerConfigured === false;
+  const qaStartDisabled = qaModeUnavailable || qaSessionActive || qaStatus === 'STARTING' || qaStatus === 'THINKING' || qaStatus === 'SPEAKING';
+  const qaStopDisabled = !qaSessionActive && !isTaskActive(qaAsrStatusRef.current) && !isTaskActive(qaTtsStatusRef.current);
+  const qaStatusText =
+    qaStatus === 'IDLE'
+      ? '空闲'
+      : qaStatus === 'STARTING'
+        ? '正在启动语音会话...'
+        : qaStatus === 'LISTENING'
+          ? '等待用户说话...'
+          : qaStatus === 'THINKING'
+            ? 'LLM 正在生成回答...'
+            : qaStatus === 'SPEAKING'
+              ? '正在播放回答，麦克风已暂停'
+              : 'QA 会话异常';
+
+  return (
+    <div className="shell">
+      <div className="backdrop" />
+      <div className="frame">
+        <section className="hero">
+          <div>
+            <p className="eyebrow">Voice Protocol v2</p>
+            <h1>Testing and QA, clearly separated.</h1>
+            <p className="hero-copy">
+              测试模式专注独立验证 ASR 与本地 TTS，QA 模式专注完整的 ASR - LLM - TTS 闭环。
+            </p>
+          </div>
+          <div className="ws-card">
+            <label htmlFor="ws-url">WebSocket URL</label>
+            <input id="ws-url" value={wsUrlInput} onChange={(event) => setWsUrlInput(event.target.value)} />
+            <div className="ws-controls">
+              <div className="status-row ws-toolbar">
+                <span className={statusClass(connectionStatus)}>{connectionStatus}</span>
+                <button className="ghost" onClick={reconnect}>
+                  Reconnect
+                </button>
+              </div>
+              <div className="mode-switch" role="tablist" aria-label="View mode">
+                <button
+                  className={viewMode === 'test' ? 'mode-tab active' : 'mode-tab'}
+                  onClick={() => handleModeChange('test')}
+                  type="button"
+                >
+                  Test Mode
+                </button>
+                <button
+                  className={viewMode === 'qa' ? 'mode-tab active' : 'mode-tab'}
+                  onClick={() => handleModeChange('qa')}
+                  type="button"
+                >
+                  QA Mode
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {viewMode === 'test' ? (
+          <section className="panel-grid">
+            <article className="panel">
+              <div className="panel-head">
+                <div>
+                  <h2>ASR Test</h2>
+                  <p className="panel-copy">手动验证实时识别链路，只关注麦克风到识别结果。</p>
+                </div>
+                <span className={statusClass(testAsrStatus)}>{testAsrStatus}</span>
+              </div>
+
+              <div className="actions">
+                <button className="primary" onClick={startTestAsr} disabled={isTaskActive(testAsrStatus)}>
+                  Start ASR
+                </button>
+                <button className="ghost" onClick={stopTestAsr} disabled={!isTaskActive(testAsrStatus)}>
+                  Stop ASR
+                </button>
+              </div>
+
+              {testAsrError ? <p className="error-text">{testAsrError}</p> : null}
+
+              <div className="result-card">
+                <div className="result-label">Partial</div>
+                <div className="result-text">{testAsrPartial || '等待语音输入...'}</div>
+              </div>
+
+              <div className="result-card">
+                <div className="result-label">Final</div>
+                <div className="final-list">
+                  {testAsrFinalLines.length === 0 ? <div className="muted">识别结果会追加在这里。</div> : null}
+                  {testAsrFinalLines.map((line, index) => (
+                    <div key={`${line}-${index}`}>{line}</div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="log-card">
+                <div className="log-head">
+                  <h3>ASR Logs</h3>
+                  <button className="mini" onClick={() => setTestAsrLogs([])}>
+                    Clear
+                  </button>
+                </div>
+                <pre>{testAsrLogs.join('\n') || '暂无日志。'}</pre>
+              </div>
+            </article>
+
+            <article className="panel">
+              <div className="panel-head">
+                <div>
+                  <h2>TTS Test</h2>
+                  <p className="panel-copy">独立验证纯文本本地 TTS 播放，不受 QA 会话状态影响。</p>
+                </div>
+                <span className={statusClass(testTtsStatus)}>{testTtsStatus}</span>
+              </div>
+
+              <div className="field-grid">
+                <label>
+                  <span>Voice</span>
+                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)}>
+                    {voices.map((voice) => (
+                      <option key={voice.id} value={voice.id}>
+                        {voice.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  <span>Speech Rate</span>
+                  <input
+                    type="number"
+                    min="0.5"
+                    max="2.0"
+                    step="0.1"
+                    value={ttsSpeechRate}
+                    onChange={(event) => setTtsSpeechRate(clampSpeechRate(Number(event.target.value)))}
+                  />
+                </label>
+
+              </div>
+
+              <label className="stacked-field">
+                <span>Input</span>
+                <textarea value={testTtsText} onChange={(event) => setTestTtsText(event.target.value)} rows={8} />
+              </label>
+
+              <div className="actions">
+                <button className="primary" onClick={startTestTts} disabled={testTtsStatus === 'CONNECTING' || testTtsStatus === 'STREAMING'}>
+                  Start TTS
+                </button>
+                <button className="ghost" onClick={stopTestTts} disabled={!isTaskActive(testTtsStatus)}>
+                  Stop TTS
+                </button>
+              </div>
+
+              {testTtsError ? <p className="error-text">{testTtsError}</p> : null}
+
+              <div className="result-card">
+                <div className="result-label">Rendered Text</div>
+                <div className="result-text">{testTtsRenderedText || testTtsText}</div>
+              </div>
+
+              <div className="meta-row">
+                <span>SampleRate: {testTtsSampleRate}</span>
+                <span>Channels: {testTtsChannels}</span>
+                <span>SpeechRate: {ttsSpeechRate.toFixed(1)}</span>
+              </div>
+
+              <div className="log-card">
+                <div className="log-head">
+                  <h3>TTS Logs</h3>
+                  <button className="mini" onClick={() => setTestTtsLogs([])}>
+                    Clear
+                  </button>
+                </div>
+                <pre>{testTtsLogs.join('\n') || '暂无日志。'}</pre>
+              </div>
+            </article>
+          </section>
+        ) : (
+          <section className="qa-layout">
+            <article className="panel qa-panel">
+              <div className="panel-head">
+                <div>
+                  <h2>QA Mode</h2>
+                  <p className="panel-copy">单按钮启动完整会话：ASR -&gt; LLM -&gt; TTS -&gt; 等待下一轮用户输入。</p>
+                </div>
+                <span className={qaStatusClass(qaStatus)}>{qaStatus}</span>
+              </div>
+
+              <div className="field-grid">
+                <label>
+                  <span>Voice</span>
+                  <select value={selectedVoice} onChange={(event) => setSelectedVoice(event.target.value)}>
+                    {voices.map((voice) => (
+                      <option key={voice.id} value={voice.id}>
+                        {voice.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  <span>Speech Rate</span>
+                  <input
+                    type="number"
+                    min="0.5"
+                    max="2.0"
+                    step="0.1"
+                    value={ttsSpeechRate}
+                    onChange={(event) => setTtsSpeechRate(clampSpeechRate(Number(event.target.value)))}
+                  />
+                </label>
+
+                <label>
+                  <span>Send Pause (s)</span>
+                  <input
+                    type="number"
+                    min={QA_SEND_PAUSE_MIN_SECONDS}
+                    max={QA_SEND_PAUSE_MAX_SECONDS}
+                    step="0.1"
+                    value={qaSendPauseSeconds}
+                    onChange={(event) => setQaSendPauseSeconds(clampQaSendPauseSeconds(Number(event.target.value)))}
+                  />
+                </label>
+              </div>
+
+              <div className="actions qa-actions">
+                <div className="qa-primary-actions">
+                  <button className="primary" onClick={startQa} disabled={qaStartDisabled}>
+                    Start QA
+                  </button>
+                  <button className="ghost" onClick={stopQa} disabled={qaStopDisabled}>
+                    Stop QA
+                  </button>
+                </div>
+                <div className="qa-chat-inline">
+                  <button className="ghost" onClick={startNewQaChat} disabled={!qaSessionActive && !qaChatId}>
+                    New Chat
+                  </button>
+                  <span className="qa-chat-id" title={qaChatId || '新会话'}>
+                    {qaChatId || '新会话'}
+                  </span>
+                </div>
+              </div>
+
+              {qaModeUnavailable ? <p className="warn-text">当前后端未配置 runner，QA 模式不可用。</p> : null}
+              {qaNotice ? <p className="warn-text">{qaNotice}</p> : null}
+              {qaError ? <p className="error-text">{qaError}</p> : null}
+
+              <div className="qa-summary-row">
+                <div className="result-card qa-summary-card">
+                  <div className="result-label">QA Status</div>
+                  <div className="result-text">{qaStatusText}</div>
+                </div>
+
+                <div className="result-card qa-summary-card">
+                  <div className="result-label">Microphone</div>
+                  <div className="result-text">{qaMicPaused ? 'TTS 播放期间已暂停采集。' : '麦克风处于可采集状态。'}</div>
+                </div>
+              </div>
+
+              <div className="qa-grid">
+                <div className="result-card">
+                  <div className="result-label">Latest User Utterance</div>
+                  <div className="result-text">{qaLatestUtterance || '等待用户说话...'}</div>
+                </div>
+
+                <div className="result-card">
+                  <div className="result-label">Assistant Response</div>
+                  <div className="result-text">{qaAssistantResponse || '等待 LLM 返回回答...'}</div>
+                </div>
+              </div>
+
+              <div className="meta-row">
+                <span>SampleRate: {qaTtsSampleRate}</span>
+                <span>Channels: {qaTtsChannels}</span>
+                <span>SpeechRate: {ttsSpeechRate.toFixed(1)}</span>
+                <span>SendPause: {qaSendPauseSeconds.toFixed(1)}s</span>
+              </div>
+
+              <div className="log-card">
+                <div className="log-head">
+                  <h3>QA Logs</h3>
+                  <button className="mini" onClick={() => setQaLogs([])}>
+                    Clear
+                  </button>
+                </div>
+                <pre>{qaLogs.join('\n') || '暂无日志。'}</pre>
+              </div>
+            </article>
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}

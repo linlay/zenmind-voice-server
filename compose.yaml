@@ -1,0 +1,29 @@
+services:
+  voice-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zenmind-voice-server:local
+    env_file:
+      - .env
+    ports:
+      - "11953:11953"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:11953/actuator/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  voice-console:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: zenmind-voice-console:local
+    depends_on:
+      voice-server:
+        condition: service_healthy
+    ports:
+      - "8088:80"
+    restart: unless-stopped
