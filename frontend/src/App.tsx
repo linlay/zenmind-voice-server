@@ -98,10 +98,7 @@ function isLocalDevHost(hostname: string): boolean {
 
 function resolveDefaultWsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const { hostname, port, host } = window.location;
-  if (isLocalDevHost(hostname) && port === '5173') {
-    return `${protocol}//${hostname}:11953/api/voice/ws`;
-  }
+  const { host } = window.location;
   return `${protocol}//${host}/api/voice/ws`;
 }
 

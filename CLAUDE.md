@@ -21,11 +21,12 @@
 - QA 模式依赖外部 runner SSE
 
 ## 4. 目录结构
+- `Makefile`：根目录统一开发命令入口
 - `cmd/voice-server`：服务启动入口
 - `internal/httpapi`：REST 接口
 - `internal/ws`：WebSocket 协议实现
 - `frontend`：本地调试控制台
-- `docker-compose.yml`：标准 compose 入口
+- `compose.yml`：标准 compose 入口
 
 ## 5. 数据结构
 - `config.App`
@@ -41,14 +42,17 @@
 
 ## 7. 开发要点
 - 默认服务端口仍由 `SERVER_PORT` 控制
+- compose 控制台端口由 `FRONTEND_PORT` 控制
+- `compose.yml` 同时使用 compose 变量插值和 `voice-server` 的 `env_file: .env`
 - 对外路径只维护 `/api/voice/*`
 - 当前版本未内建业务鉴权，接入方需在网关或部署层控制访问
 
 ## 8. 开发流程
 1. `cp .env.example .env`
-2. `go run ./cmd/voice-server`
-3. `cd frontend && npm install && npm run dev`
-4. `docker compose up --build`
+2. `make run`
+3. `make frontend-dev`
+4. `make test`
+5. `make docker-up`
 
 ## 9. 已知约束与注意事项
 - 本轮总控只接入 backend API，不公开 console
