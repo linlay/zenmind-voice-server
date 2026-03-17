@@ -38,6 +38,14 @@ func TestConnectionReady(t *testing.T) {
 	if message["protocolVersion"] != "v2" {
 		t.Fatalf("unexpected protocolVersion: %#v", message["protocolVersion"])
 	}
+	capabilities, _ := message["capabilities"].(map[string]any)
+	if capabilities["streamInput"] != true {
+		t.Fatalf("expected streamInput=true, got %#v", capabilities["streamInput"])
+	}
+	deprecatedModes, _ := capabilities["deprecatedModes"].([]any)
+	if len(deprecatedModes) != 1 || deprecatedModes[0] != "llm" {
+		t.Fatalf("unexpected deprecatedModes: %#v", capabilities["deprecatedModes"])
+	}
 }
 
 func TestHandlerMountedAtVoiceWebSocketPath(t *testing.T) {
@@ -274,6 +282,83 @@ func TestLocalTtsStreamsAudioAndBinary(t *testing.T) {
 	}
 }
 
+func TestLocalStreamTtsAcceptsAppendAndCommit(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":      "tts.start",
+		"taskId":    "tts-stream",
+		"mode":      "local",
+		"inputMode": "stream",
+		"voice":     "Cherry",
+	})
+
+	started := readJSONMessage(t, conn)
+	if started["type"] != "task.started" {
+		t.Fatalf("expected task.started, got %#v", started)
+	}
+	if started["inputMode"] != "stream" {
+		t.Fatalf("expected inputMode=stream, got %#v", started["inputMode"])
+	}
+	format := readJSONMessage(t, conn)
+	if format["type"] != "tts.audio.format" {
+		t.Fatalf("expected tts.audio.format, got %#v", format)
+	}
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.append",
+		"taskId": "tts-stream",
+		"text":   "你好",
+	})
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.append",
+		"taskId": "tts-stream",
+		"text":   "，世界",
+	})
+	waitFor(t, time.Second, func() bool {
+		return strings.Join(ttsClient.lastAppendedTexts(), "") == "你好，世界"
+	})
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.commit",
+		"taskId": "tts-stream",
+	})
+
+	readUntilTaskStopped(t, conn)
+	if got := strings.Join(ttsClient.lastAppendedTexts(), ""); got != "你好，世界" {
+		t.Fatalf("unexpected appended texts: %q", got)
+	}
+}
+
+func TestLocalStreamTtsAppendRequiresActiveTask(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{
+		"type":   "tts.append",
+		"taskId": "missing-stream",
+		"text":   "你好",
+	})
+
+	message := readJSONMessage(t, conn)
+	if message["type"] != "error" || message["code"] != "task_not_found" {
+		t.Fatalf("unexpected response: %#v", message)
+	}
+}
+
 func TestLlmTtsStreamsTextDelta(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	runnerClient.events = []runner.Event{
@@ -492,7 +577,7 @@ func TestLocalTtsDetailedLogsEnabled(t *testing.T) {
 	waitFor(t, time.Second, func() bool {
 		logs := logBuffer.String()
 		return strings.Contains(logs, `vbd c=tts`) &&
-			strings.Contains(logs, `ev=st m=local v=Cherry sr=1.5 txt="hello log"`) &&
+			strings.Contains(logs, `ev=st m=local im=single v=Cherry sr=1.5 txt="hello log"`) &&
 			strings.Contains(logs, `ev=fmt sr=24000 ch=1 v=Cherry`) &&
 			!strings.Contains(logs, `vd=`) &&
 			strings.Contains(logs, `ev=chk seq=1 ab=4`) &&
@@ -539,8 +624,8 @@ func TestLlmTtsDetailedLogsEnabled(t *testing.T) {
 	waitFor(t, time.Second, func() bool {
 		logs := logBuffer.String()
 		return strings.Contains(logs, `vbd c=tts`) &&
-			strings.Contains(logs, `ev=st m=llm v=Cherry sr=1.2 txt=summarize ak=demo`) &&
-			!strings.Contains(logs, `ev=st m=llm v=Cherry sr=1.2 txt=summarize cid=`) &&
+			strings.Contains(logs, `ev=st m=llm im=single v=Cherry sr=1.2 txt=summarize ak=demo`) &&
+			!strings.Contains(logs, `ev=st m=llm im=single v=Cherry sr=1.2 txt=summarize cid=`) &&
 			strings.Contains(logs, `ev=chat cid=chat-log`) &&
 			strings.Contains(logs, `ev=txt txt="你好"`)
 	})
@@ -620,8 +705,9 @@ func (s *fakeUpstreamSession) sentPayloads() []string {
 }
 
 type fakeRealtimeTtsClient struct {
-	mu       sync.Mutex
-	lastRate float64
+	mu          sync.Mutex
+	lastRate    float64
+	lastSession *fakeTtsSession
 }
 
 func (c *fakeRealtimeTtsClient) OpenSession(options core.TtsRequestOptions) (tts.TtsStreamSession, error) {
@@ -631,12 +717,13 @@ func (c *fakeRealtimeTtsClient) OpenSession(options core.TtsRequestOptions) (tts
 	}
 	c.mu.Lock()
 	c.lastRate = rate
-	c.mu.Unlock()
 	session := &fakeTtsSession{
 		audioCh: make(chan core.AudioChunk, 1),
 		doneCh:  make(chan struct{}),
 		errCh:   make(chan error, 1),
 	}
+	c.lastSession = session
+	c.mu.Unlock()
 	return session, nil
 }
 
@@ -646,11 +733,23 @@ func (c *fakeRealtimeTtsClient) lastSpeechRate() float64 {
 	return c.lastRate
 }
 
+func (c *fakeRealtimeTtsClient) lastAppendedTexts() []string {
+	c.mu.Lock()
+	session := c.lastSession
+	c.mu.Unlock()
+	if session == nil {
+		return nil
+	}
+	return session.appendedTexts()
+}
+
 type fakeTtsSession struct {
 	audioCh   chan core.AudioChunk
 	doneCh    chan struct{}
 	errCh     chan error
 	closeOnce sync.Once
+	mu        sync.Mutex
+	appended  []string
 }
 
 func (s *fakeTtsSession) AudioChan() <-chan core.AudioChunk { return s.audioCh }
@@ -658,7 +757,11 @@ func (s *fakeTtsSession) DoneChan() <-chan struct{}         { return s.doneCh }
 func (s *fakeTtsSession) ErrChan() <-chan error             { return s.errCh }
 func (s *fakeTtsSession) SampleRate() int                   { return 24000 }
 func (s *fakeTtsSession) Channels() int                     { return 1 }
-func (s *fakeTtsSession) AppendText(string)                 {}
+func (s *fakeTtsSession) AppendText(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appended = append(s.appended, text)
+}
 func (s *fakeTtsSession) Finish() {
 	s.closeOnce.Do(func() {
 		chunk, _ := core.NewAudioChunk([]byte{1, 2, 3, 4}, 24000, 1)
@@ -669,6 +772,11 @@ func (s *fakeTtsSession) Finish() {
 			close(s.doneCh)
 		}()
 	})
+}
+func (s *fakeTtsSession) appendedTexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.appended...)
 }
 func (s *fakeTtsSession) Cancel() {
 	s.closeOnce.Do(func() {

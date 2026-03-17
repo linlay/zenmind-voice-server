@@ -59,9 +59,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"sessionId":       session.sessionID,
 		"protocolVersion": "v2",
 		"capabilities": map[string]any{
-			"asr":      true,
-			"tts":      true,
-			"ttsModes": []string{"local", "llm"},
+			"asr":             true,
+			"tts":             true,
+			"ttsModes":        []string{"local", "llm"},
+			"streamInput":     true,
+			"deprecatedModes": []string{"llm"},
 		},
 	})
 
@@ -96,6 +98,7 @@ type clientEvent struct {
 	Voice         string          `json:"voice"`
 	ChatID        string          `json:"chatId"`
 	AgentKey      string          `json:"agentKey"`
+	InputMode     string          `json:"inputMode"`
 	SpeechRate    *float64        `json:"speechRate"`
 }
 
@@ -121,6 +124,10 @@ func (h *Handler) handleTextMessage(session *sessionContext, payload []byte) {
 		h.handleAsrStop(session, event)
 	case "tts.start":
 		h.handleTtsStart(session, event)
+	case "tts.append":
+		h.handleTtsAppend(session, event)
+	case "tts.commit":
+		h.handleTtsCommit(session, event)
 	case "tts.stop":
 		h.handleTtsStop(session, event)
 	default:
@@ -234,13 +241,24 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 
 	mode := defaultString(event.Mode, h.app.Tts.DefaultMode)
+	inputMode := defaultString(event.InputMode, "single")
 	text := strings.TrimSpace(event.Text)
 	if mode != "local" && mode != "llm" {
 		session.releaseTaskID(taskID)
 		h.sendError(session, taskID, "bad_request", "Unsupported tts mode: "+mode)
 		return
 	}
-	if text == "" {
+	if inputMode != "single" && inputMode != "stream" {
+		session.releaseTaskID(taskID)
+		h.sendError(session, taskID, "bad_request", "Unsupported tts inputMode: "+inputMode)
+		return
+	}
+	if mode == "llm" && inputMode != "single" {
+		session.releaseTaskID(taskID)
+		h.sendError(session, taskID, "bad_request", "tts.start llm mode only supports single inputMode")
+		return
+	}
+	if inputMode == "single" && text == "" {
 		session.releaseTaskID(taskID)
 		h.sendError(session, taskID, "bad_request", "tts.start requires non-empty text")
 		return
@@ -273,12 +291,13 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 
 	task := &ttsTask{
-		taskID:   taskID,
-		mode:     mode,
-		text:     text,
-		chatID:   strings.TrimSpace(event.ChatID),
-		agentKey: resolvedAgentKey,
-		plan:     plan,
+		taskID:    taskID,
+		mode:      mode,
+		inputMode: inputMode,
+		text:      text,
+		chatID:    strings.TrimSpace(event.ChatID),
+		agentKey:  resolvedAgentKey,
+		plan:      plan,
 	}
 	session.setTtsTask(taskID, task)
 	resolvedSpeechRate := h.app.Tts.Local.SpeechRate
@@ -287,9 +306,12 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 	logFields := []string{
 		detailField("mode", mode),
+		detailField("input_mode", inputMode),
 		detailField("voice", task.plan.VoiceID),
 		detailField("speech_rate", resolvedSpeechRate),
-		detailField("text", task.text),
+	}
+	if task.text != "" {
+		logFields = append(logFields, detailField("text", task.text))
 	}
 	if task.mode == "llm" {
 		logFields = append(logFields,
@@ -299,6 +321,58 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	}
 	h.logTaskEvent("tts", session.sessionID, taskID, "tts.start", logFields...)
 	h.startTtsTask(session, task)
+}
+
+func (h *Handler) handleTtsAppend(session *sessionContext, event clientEvent) {
+	taskID := strings.TrimSpace(event.TaskID)
+	if taskID == "" {
+		h.sendError(session, "", "bad_request", "taskId must not be blank")
+		return
+	}
+	task := session.getTtsTask(taskID)
+	if task == nil {
+		h.sendError(session, taskID, "task_not_found", "TTS task is not active")
+		return
+	}
+	if task.mode != "local" || task.inputMode != "stream" {
+		h.sendError(session, taskID, "bad_request", "tts.append requires an active local stream task")
+		return
+	}
+	text := event.Text
+	if strings.TrimSpace(text) == "" {
+		h.sendError(session, taskID, "bad_request", "tts.append requires non-empty text")
+		return
+	}
+	h.logTaskEvent("tts", session.sessionID, taskID, "tts.append", detailField("text", text))
+	task.hasContent.Store(true)
+	task.plan.Session.AppendText(text)
+}
+
+func (h *Handler) handleTtsCommit(session *sessionContext, event clientEvent) {
+	taskID := strings.TrimSpace(event.TaskID)
+	if taskID == "" {
+		h.sendError(session, "", "bad_request", "taskId must not be blank")
+		return
+	}
+	task := session.getTtsTask(taskID)
+	if task == nil {
+		h.sendError(session, taskID, "task_not_found", "TTS task is not active")
+		return
+	}
+	if task.mode != "local" || task.inputMode != "stream" {
+		h.sendError(session, taskID, "bad_request", "tts.commit requires an active local stream task")
+		return
+	}
+	if task.committed.CompareAndSwap(false, true) {
+		h.logTaskEvent("tts", session.sessionID, taskID, "tts.commit")
+		if !task.hasContent.Load() {
+			session.sendJSON(eventBody("tts.done", session.sessionID, task.taskID, map[string]any{"reason": "no_content"}))
+			h.logTaskEvent("tts", session.sessionID, task.taskID, "tts.done", detailField("reason", "no_content"))
+			h.finishTtsTask(session, task, "no_content", true, true)
+			return
+		}
+		task.plan.Session.Finish()
+	}
 }
 
 func (h *Handler) handleTtsStop(session *sessionContext, event clientEvent) {
@@ -369,6 +443,7 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 	session.sendJSON(eventBody("task.started", session.sessionID, task.taskID, map[string]any{
 		"taskType": "tts",
 		"mode":     task.mode,
+		"inputMode": task.inputMode,
 	}))
 	h.logTaskEvent("tts", session.sessionID, task.taskID, "task.started")
 	session.sendJSON(eventBody("tts.audio.format", session.sessionID, task.taskID, map[string]any{
@@ -386,8 +461,14 @@ func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 
 	go h.streamTtsAudio(session, task)
 	if task.mode == "local" {
-		task.plan.Session.AppendText(task.text)
-		task.plan.Session.Finish()
+		if task.text != "" {
+			task.hasContent.Store(true)
+			task.plan.Session.AppendText(task.text)
+		}
+		if task.inputMode == "single" {
+			task.committed.Store(true)
+			task.plan.Session.Finish()
+		}
 		return
 	}
 
@@ -874,6 +955,7 @@ type asrTask struct {
 type ttsTask struct {
 	taskID        string
 	mode          string
+	inputMode     string
 	text          string
 	chatID        string
 	agentKey      string
@@ -881,6 +963,7 @@ type ttsTask struct {
 	stopped       atomic.Bool
 	audioSequence atomic.Int64
 	hasContent    atomic.Bool
+	committed     atomic.Bool
 	runnerCancel  context.CancelFunc
 }
 
@@ -1136,6 +1219,8 @@ func compactFieldKey(key string) string {
 		return "vd"
 	case "speech_rate", "sample_rate":
 		return "sr"
+	case "input_mode":
+		return "im"
 	case "channels":
 		return "ch"
 	case "text":

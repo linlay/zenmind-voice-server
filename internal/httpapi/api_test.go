@@ -51,6 +51,13 @@ func TestCapabilities(t *testing.T) {
 		t.Fatalf("unexpected client gate preRollMs: %#v", clientGate["preRollMs"])
 	}
 	ttsPayload := payload["tts"].(map[string]any)
+	if ttsPayload["streamInput"] != true {
+		t.Fatalf("expected streamInput=true")
+	}
+	deprecatedModes := ttsPayload["deprecatedModes"].([]any)
+	if len(deprecatedModes) != 1 || deprecatedModes[0] != "llm" {
+		t.Fatalf("unexpected deprecatedModes: %#v", deprecatedModes)
+	}
 	if ttsPayload["defaultMode"] != "local" {
 		t.Fatalf("unexpected defaultMode: %#v", ttsPayload["defaultMode"])
 	}

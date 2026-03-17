@@ -49,6 +49,8 @@ func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
 		},
 		"tts": map[string]any{
 			"modes":             []string{"local", "llm"},
+			"deprecatedModes":   []string{"llm"},
+			"streamInput":       true,
 			"defaultMode":       a.app.Tts.DefaultMode,
 			"speechRateDefault": a.app.Tts.Local.SpeechRate,
 			"audioFormat": map[string]any{

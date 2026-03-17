@@ -44,7 +44,9 @@
   },
   "tts": {
     "modes": ["local", "llm"],
+    "deprecatedModes": ["llm"],
     "defaultMode": "local",
+    "streamInput": true,
     "speechRateDefault": 1.2,
     "audioFormat": {
       "sampleRate": 24000,
@@ -90,7 +92,9 @@
   "capabilities": {
     "asr": true,
     "tts": true,
-    "ttsModes": ["local", "llm"]
+    "ttsModes": ["local", "llm"],
+    "streamInput": true,
+    "deprecatedModes": ["llm"]
   }
 }
 ```
@@ -113,7 +117,7 @@
 典型时序：
 1. 客户端连接 `/api/voice/ws`
 2. 服务端返回 `connection.ready`
-3. 客户端发送 `asr.start` 或 `tts.start`
+3. 客户端发送 `asr.start`、`tts.start` 或 `tts.start -> tts.append -> tts.commit`
 4. 服务端返回 `task.started`
 5. 任务运行过程中持续交换增量事件
 6. 服务端返回 `tts.done` 或客户端发送 `*.stop`
@@ -201,10 +205,11 @@
 必填字段：
 - `type`：固定为 `tts.start`
 - `taskId`
-- `text`：要播报的文本
 
 可选字段：
 - `mode`：`local` 或 `llm`，默认取服务端 `defaultMode`
+- `inputMode`：`single` 或 `stream`，默认 `single`
+- `text`：`inputMode=single` 时必填；`inputMode=stream` 时可省略，后续通过 `tts.append` 追加
 - `voice`：音色 ID，默认取默认音色
 - `speechRate`：语速，默认取能力接口返回值
 - `chatId`：QA 模式下用于续接上游 runner 会话
@@ -217,6 +222,7 @@
   "type": "tts.start",
   "taskId": "tts-demo",
   "mode": "local",
+  "inputMode": "single",
   "text": "你好，欢迎使用统一语音服务。",
   "voice": "voice-demo",
   "speechRate": 1.2,
@@ -226,9 +232,38 @@
 
 失败条件：
 - `taskId` 为空或冲突
-- `text` 为空
+- `inputMode=single` 时 `text` 为空
 - `mode` 非 `local` / `llm`
+- `inputMode` 非 `single` / `stream`
 - 本地 TTS 或 runner 未配置
+
+说明：
+- `mode="llm"` 仅保留兼容，推荐新接入统一改用 `mode="local" + inputMode="stream"`，由前端自己消费 `/api/query` 后持续发送 `tts.append`
+- `mode="llm"` 仅支持 `inputMode="single"`
+
+### `tts.append`
+向一个已经启动的本地流式 TTS 任务追加文本。
+
+必填字段：
+- `type`：固定为 `tts.append`
+- `taskId`
+- `text`
+
+失败条件：
+- 任务不存在
+- 当前任务不是 `mode="local" + inputMode="stream"`
+- `text` 为空
+
+### `tts.commit`
+告知服务端当前流式 TTS 任务的文本输入已经结束，服务端会等待底层 TTS 自然收尾。
+
+必填字段：
+- `type`：固定为 `tts.commit`
+- `taskId`
+
+失败条件：
+- 任务不存在
+- 当前任务不是 `mode="local" + inputMode="stream"`
 
 ### `tts.stop`
 停止一个 TTS 任务。
@@ -245,6 +280,7 @@
 - `taskId`
 - `taskType`：`asr` 或 `tts`
 - `mode`：仅 TTS 任务存在
+- `inputMode`：仅 TTS 任务存在
 
 ### `task.stopped`
 表示任务已经停止。
@@ -292,10 +328,10 @@ ASR 最终文本。
 - `voiceDisplayName`
 
 ### `tts.text.delta`
-QA 模式下 runner 持续返回的文本增量。
+兼容模式下 runner 持续返回的文本增量，仅 `mode="llm"` 时出现。
 
 ### `tts.chat.updated`
-QA 模式下 runner 返回的新 `chatId`。
+兼容模式下 runner 返回的新 `chatId`，仅 `mode="llm"` 时出现。
 
 ### `tts.audio.chunk`
 用于声明紧随其后的 binary frame 元信息。
