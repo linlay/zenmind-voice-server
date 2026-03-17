@@ -701,7 +701,7 @@ export default function App() {
     const normalizedLength = normalizeQaUtteranceForLength(mergedText).length;
     qaPendingUtteranceRef.current = '';
 
-    if (normalizedLength <= 2) {
+    if (normalizedLength < 2) {
       appendQaLog(`[ASR skipped] utterance too short (${normalizedLength} chars): ${mergedText}`);
       setQaStatusValue('LISTENING');
       return;
