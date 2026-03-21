@@ -4,7 +4,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: zenmind-voice-server:latest
+    image: voice-server-backend:latest
     env_file:
       - .env
     environment:
@@ -26,7 +26,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    image: zenmind-voice-console:latest
+    image: voice-server-frontend:latest
     depends_on:
       voice-server:
         condition: service_healthy

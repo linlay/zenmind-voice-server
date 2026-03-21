@@ -71,6 +71,8 @@ make docker-up
 - 若同时存在 `compose.yaml` 和 `docker-compose.yml`，Docker 会优先使用 `compose.yaml` 并给出多配置警告；当前已统一为单文件
 - `voice-server` 负责 backend
 - `voice-console` 仅用于本地调试控制台
+- Compose 构建后的镜像标签统一为 `voice-server-backend:latest` 和 `voice-server-frontend:latest`
+- backend / frontend 的容器名也分别是 `voice-server-backend` 和 `voice-server-frontend`，便于结合 `docker ps` / `docker images` 排查部署状态
 - 若只启动 backend 容器，可使用 `make docker-up-backend`
 - compose 打开 frontend 的地址为 `http://localhost:${FRONTEND_PORT}`，默认 `http://localhost:11954`
 - 停止 compose 环境：`make docker-down`
