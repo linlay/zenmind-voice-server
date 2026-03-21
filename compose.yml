@@ -1,5 +1,5 @@
 services:
-  backend:
+  voice-server-backend:
     container_name: voice-server-backend
     build:
       context: .
@@ -21,14 +21,14 @@ services:
     networks:
       - zenmind-network
 
-  frontend:
+  voice-server-frontend:
     container_name: voice-server-frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile
     image: voice-server-frontend:latest
     depends_on:
-      backend:
+      voice-server-backend:
         condition: service_healthy
     environment:
       SERVER_PORT: ${SERVER_PORT:-11953}

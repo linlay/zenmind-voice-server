@@ -52,7 +52,7 @@ make test
 - 环境变量契约文件：`.env.example`
 - `.env` 是端口与密钥的单一事实源，当前至少维护 `SERVER_PORT` 与 `FRONTEND_PORT`
 - `compose.yml` 里的 `${SERVER_PORT}` / `${FRONTEND_PORT}` 属于 compose 变量插值
-- `backend` service 的 `env_file: .env` 属于容器运行时环境注入
+- `voice-server-backend` service 的 `env_file: .env` 属于容器运行时环境注入
 - 最重要的部署路径约束是 `/api/voice/*`
 - 若由总网关接入，应直接把 `/api/voice/*` 反代到 backend，而不是依赖 console 前端
 - LLM QA 模式支持由客户端在 `tts.start.agentKey` 中动态指定员工；`APP_VOICE_TTS_LLM_RUNNER_AGENT_KEY` 仅作为默认回退。
@@ -69,9 +69,10 @@ make docker-up
 
 - `compose.yml` 是唯一标准 compose 入口
 - 若同时存在 `compose.yaml` 和 `docker-compose.yml`，Docker 会优先使用 `compose.yaml` 并给出多配置警告；当前已统一为单文件
-- `compose.yml` 中的 service 名统一为 `backend` 和 `frontend`
+- `compose.yml` 中的 service 名统一为 `voice-server-backend` 和 `voice-server-frontend`
 - Compose 构建后的镜像标签统一为 `voice-server-backend:latest` 和 `voice-server-frontend:latest`
 - backend / frontend 的容器名也分别是 `voice-server-backend` 和 `voice-server-frontend`，便于结合 `docker ps` / `docker images` 排查部署状态
+- frontend 容器在 compose 网络内通过 service 名 `voice-server-backend` 反代 backend，避免在共享 `zenmind-network` 上使用过于通用的服务发现名
 - 若只启动 backend 容器，可使用 `make docker-up-backend`
 - compose 打开 frontend 的地址为 `http://localhost:${FRONTEND_PORT}`，默认 `http://localhost:11954`
 - 停止 compose 环境：`make docker-down`

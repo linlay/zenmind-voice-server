@@ -30,7 +30,7 @@ docker-up:
 	docker compose up --build -d
 
 docker-up-backend:
-	docker compose up --build -d backend
+	docker compose up --build -d voice-server-backend
 
 docker-down:
 	docker compose down
