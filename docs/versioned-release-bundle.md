@@ -76,7 +76,7 @@ make release VERSION=v1.0.0 ARCH=amd64
 - 目标架构：环境变量 `ARCH` 或当前机器架构
 - backend 容器构建定义：`Dockerfile`
 - frontend 容器构建定义：`frontend/Dockerfile`
-- release 模板资产：`scripts/release-assets/docker-compose.release.yml`
+- release 模板资产：`scripts/release-assets/compose.release.yml`
 - release 模板资产：`scripts/release-assets/start.sh`
 - release 模板资产：`scripts/release-assets/stop.sh`
 - release 模板资产：`scripts/release-assets/README.txt`
@@ -122,7 +122,7 @@ docker buildx build \
 
 - `images/voice-server-backend.tar`
 - `images/voice-server-frontend.tar`
-- `docker-compose.release.yml`
+- `compose.release.yml`
 - `start.sh`
 - `stop.sh`
 - `README.txt`
@@ -171,7 +171,7 @@ bundle 解压后目录如下：
 ```text
 zenmind-voice-server/
   .env.example
-  docker-compose.release.yml
+  compose.release.yml
   start.sh
   stop.sh
   README.txt
@@ -217,7 +217,7 @@ cp .env.example .env
 7. 执行：
 
 ```bash
-docker compose -f docker-compose.release.yml up -d
+docker compose -f compose.release.yml up -d
 ```
 
 ### 5.3 `stop.sh` 做了什么
@@ -225,7 +225,7 @@ docker compose -f docker-compose.release.yml up -d
 `stop.sh` 会读取同一份 `.env` 中的 `VOICE_SERVER_VERSION`，然后执行：
 
 ```bash
-docker compose -f docker-compose.release.yml down --remove-orphans
+docker compose -f compose.release.yml down --remove-orphans
 ```
 
 它只负责停止当前 release compose 环境，不会删除镜像 tar 或 bundle 文件。

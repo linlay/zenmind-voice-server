@@ -109,7 +109,7 @@ cp .env.example .env
 
 - `start.sh` 会按需加载 `images/*.tar`
 - `start.sh` 会检查 `zenmind-network`，不存在时自动创建
-- release bundle 使用 `docker-compose.release.yml`，与开发用 `compose.yml` 分离
+- release bundle 使用 `compose.release.yml`，与开发用 `compose.yml` 分离
 - release bundle 的镜像版本由 `.env` 中 `VOICE_SERVER_VERSION` 控制，打包时会自动写入 `.env.example`
 - 详细发布说明见 `docs/versioned-release-bundle.md`
 

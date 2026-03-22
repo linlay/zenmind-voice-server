@@ -54,7 +54,7 @@ docker buildx build \
 BUNDLE_ROOT="$TMP_DIR/$BUNDLE_DIR_NAME"
 mkdir -p "$BUNDLE_ROOT/images"
 
-cp "$RELEASE_ASSETS_DIR/docker-compose.release.yml" "$BUNDLE_ROOT/docker-compose.release.yml"
+cp "$RELEASE_ASSETS_DIR/compose.release.yml" "$BUNDLE_ROOT/compose.release.yml"
 cp "$RELEASE_ASSETS_DIR/start.sh" "$BUNDLE_ROOT/start.sh"
 cp "$RELEASE_ASSETS_DIR/stop.sh" "$BUNDLE_ROOT/stop.sh"
 cp "$RELEASE_ASSETS_DIR/README.txt" "$BUNDLE_ROOT/README.txt"
