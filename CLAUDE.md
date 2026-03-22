@@ -22,11 +22,14 @@
 
 ## 4. 目录结构
 - `Makefile`：根目录统一开发命令入口
+- `VERSION`：正式发布版本单一来源
 - `cmd/voice-server`：服务启动入口
 - `internal/httpapi`：REST 接口
 - `internal/ws`：WebSocket 协议实现
 - `frontend`：本地调试控制台
 - `compose.yml`：标准 compose 入口
+- `scripts/release.sh`：版本化 release 打包入口
+- `scripts/release-assets/`：离线 bundle 模板资产
 
 ## 5. 数据结构
 - `config.App`
@@ -53,6 +56,7 @@
 3. `make frontend-dev`
 4. `make test`
 5. `make docker-up`
+6. `make release`
 
 ## 9. 已知约束与注意事项
 - 本轮总控只接入 backend API，不公开 console

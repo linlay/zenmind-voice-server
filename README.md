@@ -67,7 +67,7 @@ make test
 make docker-up
 ```
 
-- `compose.yml` 是唯一标准 compose 入口
+- `compose.yml` 是开发场景的标准 compose 入口
 - 若同时存在 `compose.yaml` 和 `docker-compose.yml`，Docker 会优先使用 `compose.yaml` 并给出多配置警告；当前已统一为单文件
 - `compose.yml` 中的 service 名统一为 `voice-server-backend` 和 `voice-server-frontend`
 - Compose 构建后的镜像标签统一为 `voice-server-backend:latest` 和 `voice-server-frontend:latest`
@@ -78,7 +78,42 @@ make docker-up
 - 停止 compose 环境：`make docker-down`
 - 底层编排命令仍为 `docker compose up --build` / `docker compose down`
 
-## 5. 运维
+## 5. 版本化发布 / 离线部署
+
+正式版本的单一来源是根目录 `VERSION`，格式固定为 `vX.Y.Z`。标准 release 打包入口：
+
+```bash
+make release
+```
+
+也支持显式指定版本与目标架构：
+
+```bash
+make release VERSION=v0.1.0 ARCH=amd64
+make release VERSION=v0.1.0 ARCH=arm64
+```
+
+- 最终产物输出到 `dist/release/`
+- 产物命名规则：`zenmind-voice-server-vX.Y.Z-linux-<arch>.tar.gz`
+- 每次构建只产出一个目标架构 bundle
+- bundle 内包含预构建 backend / frontend 镜像 tar，部署端不需要源码构建环境
+
+离线部署最小步骤：
+
+```bash
+tar -xzf zenmind-voice-server-v0.1.0-linux-amd64.tar.gz
+cd zenmind-voice-server
+cp .env.example .env
+./start.sh
+```
+
+- `start.sh` 会按需加载 `images/*.tar`
+- `start.sh` 会检查 `zenmind-network`，不存在时自动创建
+- release bundle 使用 `docker-compose.release.yml`，与开发用 `compose.yml` 分离
+- release bundle 的镜像版本由 `.env` 中 `VOICE_SERVER_VERSION` 控制，打包时会自动写入 `.env.example`
+- 详细发布说明见 `docs/versioned-release-bundle.md`
+
+## 6. 运维
 
 - 健康检查：`curl -sS http://localhost:${SERVER_PORT}/actuator/health`
 - 能力接口：`curl -sS http://localhost:${SERVER_PORT}/api/voice/capabilities`

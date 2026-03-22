@@ -1,8 +1,10 @@
 APP_NAME := voice-server
 BIN_DIR := bin
 BIN_PATH := $(BIN_DIR)/$(APP_NAME)
+VERSION ?= $(shell cat VERSION 2>/dev/null)
+ARCH ?=
 
-.PHONY: build run test frontend-install frontend-dev frontend-build docker-build docker-up docker-up-backend docker-down clean
+.PHONY: build run test frontend-install frontend-dev frontend-build docker-build docker-up docker-up-backend docker-down release clean
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -34,6 +36,9 @@ docker-up-backend:
 
 docker-down:
 	docker compose down
+
+release:
+	VERSION=$(VERSION) ARCH=$(ARCH) bash scripts/release.sh
 
 clean:
 	rm -f $(BIN_PATH)
