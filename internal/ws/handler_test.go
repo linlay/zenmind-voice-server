@@ -48,6 +48,70 @@ func TestConnectionReady(t *testing.T) {
 	}
 }
 
+func TestOriginAllowlistRejectsForeignOrigin(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.WS.AllowedOrigins = []string{"https://allowed.example.com"}
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	parsed, _ := url.Parse(server.URL)
+	parsed.Scheme = "ws"
+	headers := http.Header{}
+	headers.Set("Origin", "https://attacker.example.com")
+	_, resp, err := websocket.DefaultDialer.Dial(parsed.String(), headers)
+	if err == nil {
+		t.Fatal("expected dial to fail with forbidden origin")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for foreign origin, got %v / %v", err, resp)
+	}
+}
+
+func TestOriginAllowlistAcceptsListedOrigin(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.WS.AllowedOrigins = []string{"https://allowed.example.com"}
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	parsed, _ := url.Parse(server.URL)
+	parsed.Scheme = "ws"
+	headers := http.Header{}
+	headers.Set("Origin", "https://allowed.example.com")
+	conn, _, err := websocket.DefaultDialer.Dial(parsed.String(), headers)
+	if err != nil {
+		t.Fatalf("dial with allowed origin: %v", err)
+	}
+	defer conn.Close()
+	if msg := readJSONMessage(t, conn); msg["type"] != "connection.ready" {
+		t.Fatalf("expected connection.ready, got %#v", msg["type"])
+	}
+}
+
+func TestTaskLimitExceededRejectsExtraTasks(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.WS.MaxTasksPerConn = 1
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{"type": "asr.start", "taskId": "asr-first"})
+	if msg := readJSONMessage(t, conn); msg["type"] != "task.started" {
+		t.Fatalf("expected task.started, got %#v", msg)
+	}
+
+	writeJSON(t, conn, map[string]any{"type": "asr.start", "taskId": "asr-second"})
+	msg := readJSONMessage(t, conn)
+	if msg["type"] != "error" || msg["code"] != "task_limit_exceeded" {
+		t.Fatalf("expected task_limit_exceeded error, got %#v", msg)
+	}
+}
+
 func TestHandlerMountedAtVoiceWebSocketPath(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
@@ -443,7 +507,7 @@ func TestAsrDetailedLogsEnabled(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	app.Asr.WebSocketDetailedLogEnabled = true
 
-	var logBuffer bytes.Buffer
+	var logBuffer safeBuffer
 	restoreLogs := captureStandardLogger(t, &logBuffer)
 	defer restoreLogs()
 
@@ -512,7 +576,7 @@ func TestAsrDetailedLogsEnabled(t *testing.T) {
 func TestAsrDetailedLogsDisabled(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 
-	var logBuffer bytes.Buffer
+	var logBuffer safeBuffer
 	restoreLogs := captureStandardLogger(t, &logBuffer)
 	defer restoreLogs()
 
@@ -551,7 +615,7 @@ func TestLocalTtsDetailedLogsEnabled(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	app.Tts.WebSocketDetailedLogEnabled = true
 
-	var logBuffer bytes.Buffer
+	var logBuffer safeBuffer
 	restoreLogs := captureStandardLogger(t, &logBuffer)
 	defer restoreLogs()
 
@@ -599,7 +663,7 @@ func TestLlmTtsDetailedLogsEnabled(t *testing.T) {
 		{Type: "content.delta", Delta: "你好"},
 	}
 
-	var logBuffer bytes.Buffer
+	var logBuffer safeBuffer
 	restoreLogs := captureStandardLogger(t, &logBuffer)
 	defer restoreLogs()
 
@@ -899,7 +963,24 @@ func readUntilTaskStopped(t *testing.T, conn *websocket.Conn) {
 	t.Fatal("timed out waiting for task.stopped")
 }
 
-func captureStandardLogger(t *testing.T, buffer *bytes.Buffer) func() {
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureStandardLogger(t *testing.T, buffer *safeBuffer) func() {
 	t.Helper()
 	originalWriter := log.Writer()
 	originalFlags := log.Flags()

@@ -25,6 +25,7 @@ import (
 )
 
 const proxyClientQueueFullMessage = "Client events queued before upstream ready exceeded limit"
+const taskLimitExceededMessage = "Active task limit reached for this connection"
 
 type Handler struct {
 	app        *config.App
@@ -41,18 +42,60 @@ func NewHandler(app *config.App, upstream asr.RealtimeUpstreamGateway, ttsServic
 		ttsService: ttsService,
 		runner:     runnerClient,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(_ *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				return app.WS.IsOriginAllowed(r.Header.Get("Origin"))
+			},
 		},
 	}
+}
+
+func (h *Handler) pongTimeout() time.Duration {
+	if h.app.WS.PongTimeoutMs <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(h.app.WS.PongTimeoutMs) * time.Millisecond
+}
+
+func (h *Handler) pingInterval() time.Duration {
+	if h.app.WS.PingIntervalMs <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(h.app.WS.PingIntervalMs) * time.Millisecond
+}
+
+func (h *Handler) writeTimeout() time.Duration {
+	if h.app.WS.WriteTimeoutMs <= 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(h.app.WS.WriteTimeoutMs) * time.Millisecond
+}
+
+func (h *Handler) maxMessageBytes() int64 {
+	if h.app.WS.MaxMessageBytes <= 0 {
+		return 2097152
+	}
+	return h.app.WS.MaxMessageBytes
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("ws upgrade failed: %v", err)
 		return
 	}
 
-	session := newSessionContext(conn, r.RemoteAddr)
+	session := newSessionContext(conn, r.RemoteAddr, h.writeTimeout())
+
+	conn.SetReadLimit(h.maxMessageBytes())
+	pongWait := h.pongTimeout()
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	go h.pingLoop(session)
+
 	h.logSessionEvent(session, "connection.open")
 	session.sendJSON(map[string]any{
 		"type":            "connection.ready",
@@ -82,6 +125,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.handleTextMessage(session, payload)
+	}
+}
+
+func (h *Handler) pingLoop(session *sessionContext) {
+	ticker := time.NewTicker(h.pingInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if !session.sendPing(h.writeTimeout()) {
+				return
+			}
+		case <-session.doneCh:
+			return
+		}
 	}
 }
 
@@ -141,8 +199,12 @@ func (h *Handler) handleAsrStart(session *sessionContext, event clientEvent) {
 		h.sendError(session, "", "bad_request", "taskId must not be blank")
 		return
 	}
-	if !session.reserveTaskID(taskID) {
+	switch session.reserveTaskID(taskID, h.app.WS.MaxTasksPerConn) {
+	case reserveConflict:
 		h.sendError(session, taskID, "task_conflict", "taskId is already active")
+		return
+	case reserveLimitExceeded:
+		h.sendError(session, taskID, "task_limit_exceeded", taskLimitExceededMessage)
 		return
 	}
 	if !h.app.Asr.Realtime.HasAPIKey() {
@@ -235,8 +297,12 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 		h.sendError(session, "", "bad_request", "taskId must not be blank")
 		return
 	}
-	if !session.reserveTaskID(taskID) {
+	switch session.reserveTaskID(taskID, h.app.WS.MaxTasksPerConn) {
+	case reserveConflict:
 		h.sendError(session, taskID, "task_conflict", "taskId is already active")
+		return
+	case reserveLimitExceeded:
+		h.sendError(session, taskID, "task_limit_exceeded", taskLimitExceededMessage)
 		return
 	}
 
@@ -752,6 +818,7 @@ func (h *Handler) cleanup(session *sessionContext, notify bool) {
 	if !session.closed.CompareAndSwap(false, true) {
 		return
 	}
+	session.closeDone()
 	h.logSessionEvent(session, "connection.closed")
 	for _, task := range session.listAsrTasks() {
 		h.finishAsrTask(session, task, "connection_closed", true, notify)
@@ -817,26 +884,35 @@ func (h *Handler) shouldLogDetailed(taskType string) bool {
 }
 
 type sessionContext struct {
-	conn       *websocket.Conn
-	sessionID  string
-	remoteAddr string
-	writeMu    sync.Mutex
-	taskMu     sync.Mutex
-	taskIDs    map[string]struct{}
-	asrTasks   map[string]*asrTask
-	ttsTasks   map[string]*ttsTask
-	closed     atomic.Bool
+	conn         *websocket.Conn
+	sessionID    string
+	remoteAddr   string
+	writeTimeout time.Duration
+	writeMu      sync.Mutex
+	taskMu       sync.Mutex
+	taskIDs      map[string]struct{}
+	asrTasks     map[string]*asrTask
+	ttsTasks     map[string]*ttsTask
+	closed       atomic.Bool
+	doneCh       chan struct{}
+	doneOnce     sync.Once
 }
 
-func newSessionContext(conn *websocket.Conn, remoteAddr string) *sessionContext {
+func newSessionContext(conn *websocket.Conn, remoteAddr string, writeTimeout time.Duration) *sessionContext {
 	return &sessionContext{
-		conn:       conn,
-		sessionID:  fmt.Sprintf("ws-session-%d", time.Now().UnixNano()),
-		remoteAddr: strings.TrimSpace(remoteAddr),
-		taskIDs:    make(map[string]struct{}),
-		asrTasks:   make(map[string]*asrTask),
-		ttsTasks:   make(map[string]*ttsTask),
+		conn:         conn,
+		sessionID:    fmt.Sprintf("ws-session-%d", time.Now().UnixNano()),
+		remoteAddr:   strings.TrimSpace(remoteAddr),
+		writeTimeout: writeTimeout,
+		taskIDs:      make(map[string]struct{}),
+		asrTasks:     make(map[string]*asrTask),
+		ttsTasks:     make(map[string]*ttsTask),
+		doneCh:       make(chan struct{}),
 	}
+}
+
+func (s *sessionContext) closeDone() {
+	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
 func (s *sessionContext) sendJSON(payload map[string]any) {
@@ -844,6 +920,9 @@ func (s *sessionContext) sendJSON(payload map[string]any) {
 	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return
+	}
+	if s.writeTimeout > 0 {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	}
 	_ = s.conn.WriteJSON(payload)
 }
@@ -854,21 +933,54 @@ func (s *sessionContext) sendTtsChunkPair(taskID string, seq int, chunk core.Aud
 	if s.closed.Load() {
 		return
 	}
+	if s.writeTimeout > 0 {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+	}
 	_ = s.conn.WriteJSON(eventBody("tts.audio.chunk", s.sessionID, taskID, map[string]any{
 		"seq":        seq,
 		"byteLength": len(chunk.PCM16LE),
 	}))
+	if s.writeTimeout > 0 {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+	}
 	_ = s.conn.WriteMessage(websocket.BinaryMessage, chunk.PCM16LE)
 }
 
-func (s *sessionContext) reserveTaskID(taskID string) bool {
+func (s *sessionContext) sendPing(timeout time.Duration) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closed.Load() {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	if timeout <= 0 {
+		deadline = time.Now().Add(10 * time.Second)
+	}
+	if err := s.conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+		return false
+	}
+	return true
+}
+
+type reserveResult int
+
+const (
+	reserveOK reserveResult = iota
+	reserveConflict
+	reserveLimitExceeded
+)
+
+func (s *sessionContext) reserveTaskID(taskID string, maxTasks int) reserveResult {
 	s.taskMu.Lock()
 	defer s.taskMu.Unlock()
 	if _, exists := s.taskIDs[taskID]; exists {
-		return false
+		return reserveConflict
+	}
+	if maxTasks > 0 && len(s.taskIDs) >= maxTasks {
+		return reserveLimitExceeded
 	}
 	s.taskIDs[taskID] = struct{}{}
-	return true
+	return reserveOK
 }
 
 func (s *sessionContext) releaseTaskID(taskID string) {

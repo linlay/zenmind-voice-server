@@ -230,6 +230,10 @@ func newTTSWebSocketTestServer(t *testing.T, fn func(conn *websocket.Conn)) *htt
 		if err != nil {
 			t.Fatalf("upgrade: %v", err)
 		}
+		// Client waits for session.created before any further interaction.
+		if err := conn.WriteJSON(map[string]any{"type": "session.created"}); err != nil {
+			t.Fatalf("write session.created: %v", err)
+		}
 		fn(conn)
 	}))
 }

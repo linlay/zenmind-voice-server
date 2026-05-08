@@ -94,13 +94,14 @@ type dashScopeTtsStreamSession struct {
 	doneCh  chan struct{}
 	errCh   chan error
 
-	mu         sync.Mutex
-	conn       *websocket.Conn
-	pending    []string
-	finished   bool
-	terminated bool
-	ready      bool
-	seq        uint64
+	mu           sync.Mutex
+	conn         *websocket.Conn
+	pending      []string
+	finished     bool
+	terminated   bool
+	ready        bool
+	seq          uint64
+	completeOnce sync.Once
 }
 
 func (s *dashScopeTtsStreamSession) AudioChan() <-chan core.AudioChunk {
@@ -167,16 +168,19 @@ func (s *dashScopeTtsStreamSession) Cancel() {
 	}
 	s.terminated = true
 	conn := s.conn
-	s.conn = nil
 	s.mu.Unlock()
 
 	if conn != nil {
 		_ = conn.Close()
 	}
-	s.complete()
+	// run() will detect via terminated flag or read error and call complete().
+	// If run() is still dialing (no conn yet), it will fail at handshake timeout
+	// and complete() will then close the channels exactly once.
 }
 
 func (s *dashScopeTtsStreamSession) run() {
+	defer s.complete()
+
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+s.apiKey)
 	headers.Set("user-agent", "zenmind-voice-server")
@@ -264,6 +268,8 @@ func (s *dashScopeTtsStreamSession) run() {
 			}
 			select {
 			case s.audioCh <- chunk:
+			case <-s.doneCh:
+				return
 			case <-time.After(5 * time.Second):
 				s.fail(fmt.Errorf("tts audio channel blocked"))
 				return
@@ -351,23 +357,18 @@ func (s *dashScopeTtsStreamSession) fail(err error) {
 }
 
 func (s *dashScopeTtsStreamSession) complete() {
-	s.mu.Lock()
-	if s.conn != nil {
-		_ = s.conn.Close()
-		s.conn = nil
-	}
-	if !s.terminated {
+	s.completeOnce.Do(func() {
+		s.mu.Lock()
+		if s.conn != nil {
+			_ = s.conn.Close()
+			s.conn = nil
+		}
 		s.terminated = true
-	}
-	s.mu.Unlock()
+		s.mu.Unlock()
 
-	select {
-	case <-s.doneCh:
-		return
-	default:
 		close(s.doneCh)
 		close(s.audioCh)
-	}
+	})
 }
 
 func buildDashScopeRealtimeURL(baseURL, model string) string {

@@ -16,6 +16,16 @@ type App struct {
 	ServerPort int
 	Asr        AsrProperties
 	Tts        TtsProperties
+	WS         WSProperties
+}
+
+type WSProperties struct {
+	AllowedOrigins  []string
+	MaxMessageBytes int64
+	MaxTasksPerConn int
+	PingIntervalMs  int
+	PongTimeoutMs   int
+	WriteTimeoutMs  int
 }
 
 type AsrProperties struct {
@@ -135,6 +145,13 @@ func defaults() *App {
 			},
 			Voices: VoiceCatalogProperties{},
 		},
+		WS: WSProperties{
+			MaxMessageBytes: 2097152,
+			MaxTasksPerConn: 16,
+			PingIntervalMs:  30000,
+			PongTimeoutMs:   60000,
+			WriteTimeoutMs:  10000,
+		},
 	}
 }
 
@@ -179,6 +196,13 @@ func applyEnv(cfg *App) error {
 		return err
 	}
 	cfg.Tts.Voices.Options = voiceOptions
+
+	cfg.WS.AllowedOrigins = envStringList("APP_VOICE_WS_ALLOWED_ORIGINS", cfg.WS.AllowedOrigins)
+	cfg.WS.MaxMessageBytes = envInt64("APP_VOICE_WS_MAX_MESSAGE_BYTES", cfg.WS.MaxMessageBytes)
+	cfg.WS.MaxTasksPerConn = envInt("APP_VOICE_WS_MAX_TASKS_PER_CONN", cfg.WS.MaxTasksPerConn)
+	cfg.WS.PingIntervalMs = envInt("APP_VOICE_WS_PING_INTERVAL_MS", cfg.WS.PingIntervalMs)
+	cfg.WS.PongTimeoutMs = envInt("APP_VOICE_WS_PONG_TIMEOUT_MS", cfg.WS.PongTimeoutMs)
+	cfg.WS.WriteTimeoutMs = envInt("APP_VOICE_WS_WRITE_TIMEOUT_MS", cfg.WS.WriteTimeoutMs)
 	return nil
 }
 
@@ -277,6 +301,22 @@ func (c ClientGateProperties) Normalized() ClientGateProperties {
 	return c
 }
 
+func (w WSProperties) IsOriginAllowed(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if len(w.AllowedOrigins) == 0 {
+		return true
+	}
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range w.AllowedOrigins {
+		if strings.EqualFold(strings.TrimSpace(allowed), origin) {
+			return true
+		}
+	}
+	return false
+}
+
 func (l LocalTtsProperties) HasAPIKey() bool {
 	return strings.TrimSpace(l.APIKey) != ""
 }
@@ -359,6 +399,34 @@ func envFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
+}
+
+func envInt64(key string, fallback int64) int64 {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envStringList(key string, fallback []string) []string {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func envBool(key string, fallback bool) bool {
