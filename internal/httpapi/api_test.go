@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"zenmind-voice-server/internal/config"
+	"zenmind-voice-server/internal/health"
 	"zenmind-voice-server/internal/tts"
 )
 
@@ -106,6 +107,65 @@ func TestVoices(t *testing.T) {
 	}
 	if payload.Voices[0].ID != "Cherry" || !payload.Voices[0].Default {
 		t.Fatalf("unexpected first voice: %+v", payload.Voices[0])
+	}
+}
+
+func TestLivenessAlwaysUp(t *testing.T) {
+	app := configTestApp()
+	api := New(app, tts.NewVoiceCatalog(app))
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	for _, path := range []string{"/actuator/health", "/actuator/health/liveness"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s expected 200, got %d", path, rec.Code)
+		}
+	}
+}
+
+func TestReadinessReturns503WhenUpstreamFails(t *testing.T) {
+	app := configTestApp()
+	asrProbe := health.New()
+	ttsProbe := health.New()
+	api := NewWithProbes(app, tts.NewVoiceCatalog(app), asrProbe, ttsProbe, nil)
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	for i := 0; i < 5; i++ {
+		asrProbe.ObserveFailure()
+	}
+	req := httptest.NewRequest(http.MethodGet, "/actuator/health/readiness", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 after upstream failures, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	for i := 0; i < 10; i++ {
+		asrProbe.ObserveSuccess()
+	}
+	req = httptest.NewRequest(http.MethodGet, "/actuator/health/readiness", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 after recovery, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReadinessReturns503WhenDraining(t *testing.T) {
+	app := configTestApp()
+	api := NewWithProbes(app, tts.NewVoiceCatalog(app), health.New(), health.New(), DrainGateFunc(func() bool { return true }))
+	mux := http.NewServeMux()
+	api.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/actuator/health/readiness", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when draining, got %d", rec.Code)
 	}
 }
 

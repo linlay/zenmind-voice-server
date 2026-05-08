@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"zenmind-voice-server/internal/config"
+	"zenmind-voice-server/internal/health"
 )
 
 type RealtimeUpstreamGateway interface {
@@ -40,9 +41,14 @@ type UpstreamListener interface {
 type DashScopeRealtimeGateway struct {
 	props  config.RealtimeProxyProperties
 	dialer *websocket.Dialer
+	probe  *health.ConnectProbe
 }
 
 func NewDashScopeRealtimeGateway(app *config.App) *DashScopeRealtimeGateway {
+	return NewDashScopeRealtimeGatewayWithProbe(app, nil)
+}
+
+func NewDashScopeRealtimeGatewayWithProbe(app *config.App, probe *health.ConnectProbe) *DashScopeRealtimeGateway {
 	timeout := time.Duration(app.Asr.Realtime.ConnectTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -52,6 +58,7 @@ func NewDashScopeRealtimeGateway(app *config.App) *DashScopeRealtimeGateway {
 		dialer: &websocket.Dialer{
 			HandshakeTimeout: timeout,
 		},
+		probe: probe,
 	}
 }
 
@@ -79,7 +86,13 @@ func (g *DashScopeRealtimeGateway) Connect(ctx context.Context, _ string, option
 
 	conn, _, err := g.dialer.DialContext(ctx, buildRealtimeURL(g.props.BaseURL, model), headers)
 	if err != nil {
+		if g.probe != nil {
+			g.probe.ObserveFailure()
+		}
 		return nil, err
+	}
+	if g.probe != nil {
+		g.probe.ObserveSuccess()
 	}
 
 	session := &dashScopeRealtimeSession{

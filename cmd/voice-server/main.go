@@ -11,6 +11,7 @@ import (
 
 	"zenmind-voice-server/internal/asr"
 	"zenmind-voice-server/internal/config"
+	"zenmind-voice-server/internal/health"
 	"zenmind-voice-server/internal/httpapi"
 	"zenmind-voice-server/internal/runner"
 	"zenmind-voice-server/internal/tts"
@@ -23,14 +24,17 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	asrProbe := health.New()
+	ttsProbe := health.New()
+
 	voiceCatalog := tts.NewVoiceCatalog(cfg)
-	ttsClient := tts.NewDashScopeRealtimeClient(cfg)
+	ttsClient := tts.NewDashScopeRealtimeClientWithProbe(cfg, ttsProbe)
 	ttsService := tts.NewSynthesisService(cfg, voiceCatalog, ttsClient)
-	asrGateway := asr.NewDashScopeRealtimeGateway(cfg)
+	asrGateway := asr.NewDashScopeRealtimeGatewayWithProbe(cfg, asrProbe)
 	runnerClient := runner.NewHTTPClient(cfg)
 
 	wsHandler := ws.NewHandler(cfg, asrGateway, ttsService, runnerClient)
-	apiHandler := httpapi.New(cfg, voiceCatalog)
+	apiHandler := httpapi.NewWithProbes(cfg, voiceCatalog, asrProbe, ttsProbe, httpapi.DrainGateFunc(wsHandler.IsDraining))
 
 	mux := http.NewServeMux()
 	apiHandler.Register(mux)

@@ -51,6 +51,11 @@ func NewHandler(app *config.App, upstream asr.RealtimeUpstreamGateway, ttsServic
 	}
 }
 
+// IsDraining 返回 Handler 是否进入了优雅关闭流程，用于 readiness 探针判断。
+func (h *Handler) IsDraining() bool {
+	return h.draining.Load()
+}
+
 // Shutdown 通知所有活跃会话进入 draining 状态：先发 connection.draining 事件，
 // 给客户端 ctx 截止时间内的宽限期，到期后强制关闭所有连接。
 func (h *Handler) Shutdown(ctx context.Context) error {

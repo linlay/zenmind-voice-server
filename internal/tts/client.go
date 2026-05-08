@@ -17,19 +17,26 @@ import (
 
 	"zenmind-voice-server/internal/config"
 	"zenmind-voice-server/internal/core"
+	"zenmind-voice-server/internal/health"
 )
 
 type DashScopeRealtimeClient struct {
 	props  config.LocalTtsProperties
 	dialer *websocket.Dialer
+	probe  *health.ConnectProbe
 }
 
 func NewDashScopeRealtimeClient(app *config.App) *DashScopeRealtimeClient {
+	return NewDashScopeRealtimeClientWithProbe(app, nil)
+}
+
+func NewDashScopeRealtimeClientWithProbe(app *config.App, probe *health.ConnectProbe) *DashScopeRealtimeClient {
 	return &DashScopeRealtimeClient{
 		props: app.Tts.Local,
 		dialer: &websocket.Dialer{
 			HandshakeTimeout: 10 * time.Second,
 		},
+		probe: probe,
 	}
 }
 
@@ -73,6 +80,7 @@ func (c *DashScopeRealtimeClient) OpenSession(options core.TtsRequestOptions) (T
 		audioCh:        make(chan core.AudioChunk, 32),
 		doneCh:         make(chan struct{}),
 		errCh:          make(chan error, 1),
+		probe:          c.probe,
 	}
 	go session.run()
 	return session, nil
@@ -94,6 +102,7 @@ type dashScopeTtsStreamSession struct {
 	doneCh  chan struct{}
 	errCh   chan error
 
+	probe        *health.ConnectProbe
 	mu           sync.Mutex
 	conn         *websocket.Conn
 	pending      []string
@@ -187,8 +196,14 @@ func (s *dashScopeTtsStreamSession) run() {
 
 	conn, _, err := s.dialer.Dial(buildDashScopeRealtimeURL(s.endpoint, s.model), headers)
 	if err != nil {
+		if s.probe != nil {
+			s.probe.ObserveFailure()
+		}
 		s.fail(fmt.Errorf("realtime TTS request failed: %w", err))
 		return
+	}
+	if s.probe != nil {
+		s.probe.ObserveSuccess()
 	}
 
 	// Wait for session.created before sending any data
