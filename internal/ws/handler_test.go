@@ -173,6 +173,51 @@ func TestQueueAsrEventsBeforeUpstreamReady(t *testing.T) {
 	}
 }
 
+func TestSlowClientGetsDroppedWithoutBlockingUpstream(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	app.WS.OutboundQueueSize = 4
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn := dialWS(t, server.URL)
+	defer conn.Close()
+	_ = readJSONMessage(t, conn)
+
+	writeJSON(t, conn, map[string]any{"type": "asr.start", "taskId": "asr-slow"})
+	if msg := readJSONMessage(t, conn); msg["type"] != "task.started" {
+		t.Fatalf("expected task.started, got %#v", msg)
+	}
+
+	// Stop reading from this point on; upstream is going to spam events.
+	waitFor(t, time.Second, func() bool { return gateway.listener != nil })
+
+	// Time how long upstream listener calls take. They must not be blocked
+	// by the slow client even after the outbound queue overflows.
+	const burst = 200
+	maxLatency := time.Duration(0)
+	for i := 0; i < burst; i++ {
+		start := time.Now()
+		gateway.listener.OnMessage(`{"type":"response.audio_transcript.delta","delta":"x"}`)
+		if elapsed := time.Since(start); elapsed > maxLatency {
+			maxLatency = elapsed
+		}
+	}
+
+	if maxLatency > 200*time.Millisecond {
+		t.Fatalf("upstream listener was blocked by slow client (max=%v)", maxLatency)
+	}
+
+	// Server should have closed the connection on overflow.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+	}
+}
+
 func TestAsrStartAcceptsClientGateWithoutForwardingUpstream(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)

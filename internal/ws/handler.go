@@ -84,7 +84,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := newSessionContext(conn, r.RemoteAddr, h.writeTimeout())
+	session := newSessionContext(conn, r.RemoteAddr, h.writeTimeout(), h.app.WS.OutboundQueueSize)
 
 	conn.SetReadLimit(h.maxMessageBytes())
 	pongWait := h.pongTimeout()
@@ -94,6 +94,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	go session.writerLoop()
 	go h.pingLoop(session)
 
 	h.logSessionEvent(session, "connection.open")
@@ -819,12 +820,17 @@ func (h *Handler) cleanup(session *sessionContext, notify bool) {
 		return
 	}
 	session.closeDone()
-	h.logSessionEvent(session, "connection.closed")
+	closeReason := "connection_closed"
+	if session.overflow.Load() {
+		closeReason = "outbound_overflow"
+		notify = false
+	}
+	h.logSessionEvent(session, "connection.closed", detailField("reason", closeReason))
 	for _, task := range session.listAsrTasks() {
-		h.finishAsrTask(session, task, "connection_closed", true, notify)
+		h.finishAsrTask(session, task, closeReason, true, notify)
 	}
 	for _, task := range session.listTtsTasks() {
-		h.finishTtsTask(session, task, "connection_closed", true, notify)
+		h.finishTtsTask(session, task, closeReason, true, notify)
 	}
 	_ = session.conn.Close()
 }
@@ -883,27 +889,40 @@ func (h *Handler) shouldLogDetailed(taskType string) bool {
 	}
 }
 
+type outboundMessage struct {
+	// 普通 JSON 事件（与 pair* 互斥）
+	json map[string]any
+	// TTS 配对帧：先写 header JSON，紧接着写 binary，保证不被打散
+	pairHeader map[string]any
+	pairBinary []byte
+}
+
 type sessionContext struct {
 	conn         *websocket.Conn
 	sessionID    string
 	remoteAddr   string
 	writeTimeout time.Duration
-	writeMu      sync.Mutex
+	outboundCh   chan outboundMessage
 	taskMu       sync.Mutex
 	taskIDs      map[string]struct{}
 	asrTasks     map[string]*asrTask
 	ttsTasks     map[string]*ttsTask
 	closed       atomic.Bool
+	overflow     atomic.Bool
 	doneCh       chan struct{}
 	doneOnce     sync.Once
 }
 
-func newSessionContext(conn *websocket.Conn, remoteAddr string, writeTimeout time.Duration) *sessionContext {
+func newSessionContext(conn *websocket.Conn, remoteAddr string, writeTimeout time.Duration, queueSize int) *sessionContext {
+	if queueSize <= 0 {
+		queueSize = 64
+	}
 	return &sessionContext{
 		conn:         conn,
 		sessionID:    fmt.Sprintf("ws-session-%d", time.Now().UnixNano()),
 		remoteAddr:   strings.TrimSpace(remoteAddr),
 		writeTimeout: writeTimeout,
+		outboundCh:   make(chan outboundMessage, queueSize),
 		taskIDs:      make(map[string]struct{}),
 		asrTasks:     make(map[string]*asrTask),
 		ttsTasks:     make(map[string]*ttsTask),
@@ -915,40 +934,82 @@ func (s *sessionContext) closeDone() {
 	s.doneOnce.Do(func() { close(s.doneCh) })
 }
 
-func (s *sessionContext) sendJSON(payload map[string]any) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.closed.Load() {
-		return
+func (s *sessionContext) writerLoop() {
+	for {
+		select {
+		case msg := <-s.outboundCh:
+			if !s.writeOutbound(msg) {
+				s.closeDone()
+				return
+			}
+		case <-s.doneCh:
+			return
+		}
 	}
+}
+
+func (s *sessionContext) writeOutbound(msg outboundMessage) bool {
 	if s.writeTimeout > 0 {
 		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
 	}
-	_ = s.conn.WriteJSON(payload)
+	if msg.pairBinary != nil {
+		if err := s.conn.WriteJSON(msg.pairHeader); err != nil {
+			return false
+		}
+		if s.writeTimeout > 0 {
+			_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		}
+		if err := s.conn.WriteMessage(websocket.BinaryMessage, msg.pairBinary); err != nil {
+			return false
+		}
+		return true
+	}
+	if err := s.conn.WriteJSON(msg.json); err != nil {
+		return false
+	}
+	return true
+}
+
+func (s *sessionContext) sendJSON(payload map[string]any) {
+	if s.closed.Load() {
+		return
+	}
+	select {
+	case s.outboundCh <- outboundMessage{json: payload}:
+	case <-s.doneCh:
+	default:
+		s.markOverflow()
+	}
 }
 
 func (s *sessionContext) sendTtsChunkPair(taskID string, seq int, chunk core.AudioChunk) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return
 	}
-	if s.writeTimeout > 0 {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
-	}
-	_ = s.conn.WriteJSON(eventBody("tts.audio.chunk", s.sessionID, taskID, map[string]any{
+	header := eventBody("tts.audio.chunk", s.sessionID, taskID, map[string]any{
 		"seq":        seq,
 		"byteLength": len(chunk.PCM16LE),
-	}))
-	if s.writeTimeout > 0 {
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+	})
+	select {
+	case s.outboundCh <- outboundMessage{pairHeader: header, pairBinary: chunk.PCM16LE}:
+	case <-s.doneCh:
+	default:
+		s.markOverflow()
 	}
-	_ = s.conn.WriteMessage(websocket.BinaryMessage, chunk.PCM16LE)
+}
+
+// markOverflow 在出站队列被慢客户端撑满时触发：标记会话被踢，关闭 doneCh，
+// readLoop 检测到 conn 关闭后会走正常 cleanup 流程释放上游资源。
+func (s *sessionContext) markOverflow() {
+	if !s.closed.CompareAndSwap(false, true) {
+		return
+	}
+	s.overflow.Store(true)
+	s.closeDone()
+	_ = s.conn.Close()
 }
 
 func (s *sessionContext) sendPing(timeout time.Duration) bool {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return false
 	}

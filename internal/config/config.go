@@ -20,12 +20,13 @@ type App struct {
 }
 
 type WSProperties struct {
-	AllowedOrigins  []string
-	MaxMessageBytes int64
-	MaxTasksPerConn int
-	PingIntervalMs  int
-	PongTimeoutMs   int
-	WriteTimeoutMs  int
+	AllowedOrigins    []string
+	MaxMessageBytes   int64
+	MaxTasksPerConn   int
+	PingIntervalMs    int
+	PongTimeoutMs     int
+	WriteTimeoutMs    int
+	OutboundQueueSize int
 }
 
 type AsrProperties struct {
@@ -146,11 +147,12 @@ func defaults() *App {
 			Voices: VoiceCatalogProperties{},
 		},
 		WS: WSProperties{
-			MaxMessageBytes: 2097152,
-			MaxTasksPerConn: 16,
-			PingIntervalMs:  30000,
-			PongTimeoutMs:   60000,
-			WriteTimeoutMs:  10000,
+			MaxMessageBytes:   2097152,
+			MaxTasksPerConn:   16,
+			PingIntervalMs:    30000,
+			PongTimeoutMs:     60000,
+			WriteTimeoutMs:    10000,
+			OutboundQueueSize: 64,
 		},
 	}
 }
@@ -203,6 +205,7 @@ func applyEnv(cfg *App) error {
 	cfg.WS.PingIntervalMs = envInt("APP_VOICE_WS_PING_INTERVAL_MS", cfg.WS.PingIntervalMs)
 	cfg.WS.PongTimeoutMs = envInt("APP_VOICE_WS_PONG_TIMEOUT_MS", cfg.WS.PongTimeoutMs)
 	cfg.WS.WriteTimeoutMs = envInt("APP_VOICE_WS_WRITE_TIMEOUT_MS", cfg.WS.WriteTimeoutMs)
+	cfg.WS.OutboundQueueSize = envInt("APP_VOICE_WS_OUTBOUND_QUEUE_SIZE", cfg.WS.OutboundQueueSize)
 	return nil
 }
 
