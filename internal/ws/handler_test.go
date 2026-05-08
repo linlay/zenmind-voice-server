@@ -173,6 +173,53 @@ func TestQueueAsrEventsBeforeUpstreamReady(t *testing.T) {
 	}
 }
 
+func TestShutdownSendsDrainingThenClosesSessions(t *testing.T) {
+	app, gateway, runnerClient, ttsClient := testDependencies()
+	handler := NewHandler(app, gateway, tts.NewSynthesisService(app, tts.NewVoiceCatalog(app), ttsClient), runnerClient)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	conn1 := dialWS(t, server.URL)
+	defer conn1.Close()
+	conn2 := dialWS(t, server.URL)
+	defer conn2.Close()
+	_ = readJSONMessage(t, conn1)
+	_ = readJSONMessage(t, conn2)
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		shutdownDone <- handler.Shutdown(ctx)
+	}()
+
+	for _, c := range []*websocket.Conn{conn1, conn2} {
+		msg := readJSONMessage(t, c)
+		if msg["type"] != "connection.draining" {
+			t.Fatalf("expected connection.draining, got %#v", msg)
+		}
+		if grace, _ := msg["graceMs"].(float64); grace <= 0 {
+			t.Fatalf("expected positive graceMs, got %v", msg["graceMs"])
+		}
+	}
+
+	for _, c := range []*websocket.Conn{conn1, conn2} {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			_, _, err := c.ReadMessage()
+			if err != nil {
+				break
+			}
+		}
+	}
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return")
+	}
+}
+
 func TestSlowClientGetsDroppedWithoutBlockingUpstream(t *testing.T) {
 	app, gateway, runnerClient, ttsClient := testDependencies()
 	app.WS.OutboundQueueSize = 4

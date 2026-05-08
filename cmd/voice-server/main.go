@@ -57,8 +57,17 @@ func main() {
 	case serveErr := <-errCh:
 		log.Fatalf("server failed: %v", serveErr)
 	case <-stopCh:
+		log.Printf("voice server received stop signal, draining")
 	}
 
+	// 先给 WS 客户端 3 秒 drain 时间（发 connection.draining，让客户端主动断开重连）
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := wsHandler.Shutdown(drainCtx); err != nil && err != context.DeadlineExceeded {
+		log.Printf("ws drain: %v", err)
+	}
+	drainCancel()
+
+	// 再关 HTTP listener，等剩下的请求收尾
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {

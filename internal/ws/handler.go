@@ -33,6 +33,8 @@ type Handler struct {
 	ttsService *tts.SynthesisService
 	runner     runner.Client
 	upgrader   websocket.Upgrader
+	sessions   sync.Map // sessionID(string) -> *sessionContext
+	draining   atomic.Bool
 }
 
 func NewHandler(app *config.App, upstream asr.RealtimeUpstreamGateway, ttsService *tts.SynthesisService, runnerClient runner.Client) *Handler {
@@ -47,6 +49,59 @@ func NewHandler(app *config.App, upstream asr.RealtimeUpstreamGateway, ttsServic
 			},
 		},
 	}
+}
+
+// Shutdown 通知所有活跃会话进入 draining 状态：先发 connection.draining 事件，
+// 给客户端 ctx 截止时间内的宽限期，到期后强制关闭所有连接。
+func (h *Handler) Shutdown(ctx context.Context) error {
+	if !h.draining.CompareAndSwap(false, true) {
+		return nil
+	}
+	graceMs := 0
+	if deadline, ok := ctx.Deadline(); ok {
+		graceMs = int(time.Until(deadline) / time.Millisecond)
+		if graceMs < 0 {
+			graceMs = 0
+		}
+	}
+	h.sessions.Range(func(_, v any) bool {
+		sc := v.(*sessionContext)
+		sc.sendJSON(map[string]any{
+			"type":      "connection.draining",
+			"sessionId": sc.sessionID,
+			"graceMs":   graceMs,
+		})
+		return true
+	})
+
+	// 等到 ctx 截止或所有会话已自然关闭
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if h.activeSessions() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			h.sessions.Range(func(_, v any) bool {
+				sc := v.(*sessionContext)
+				sc.closeDone()
+				_ = sc.conn.Close()
+				return true
+			})
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Handler) activeSessions() int {
+	count := 0
+	h.sessions.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 func (h *Handler) pongTimeout() time.Duration {
@@ -96,6 +151,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	go session.writerLoop()
 	go h.pingLoop(session)
+
+	h.sessions.Store(session.sessionID, session)
 
 	h.logSessionEvent(session, "connection.open")
 	session.sendJSON(map[string]any{
@@ -819,11 +876,15 @@ func (h *Handler) cleanup(session *sessionContext, notify bool) {
 	if !session.closed.CompareAndSwap(false, true) {
 		return
 	}
+	h.sessions.Delete(session.sessionID)
 	session.closeDone()
 	closeReason := "connection_closed"
 	if session.overflow.Load() {
 		closeReason = "outbound_overflow"
 		notify = false
+	}
+	if h.draining.Load() {
+		closeReason = "draining"
 	}
 	h.logSessionEvent(session, "connection.closed", detailField("reason", closeReason))
 	for _, task := range session.listAsrTasks() {
