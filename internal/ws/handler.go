@@ -5,11 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -140,7 +138,7 @@ func (h *Handler) maxMessageBytes() int64 {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("ws upgrade failed: %v", err)
+		slog.Warn("ws upgrade failed", "err", err)
 		return
 	}
 
@@ -433,7 +431,7 @@ func (h *Handler) handleTtsStart(session *sessionContext, event clientEvent) {
 	if event.SpeechRate != nil {
 		resolvedSpeechRate = *event.SpeechRate
 	}
-	logFields := []string{
+	logFields := []slog.Attr{
 		detailField("mode", mode),
 		detailField("input_mode", inputMode),
 		detailField("voice", task.plan.VoiceID),
@@ -909,12 +907,25 @@ func (h *Handler) sendError(session *sessionContext, taskID, code, message strin
 }
 
 func (h *Handler) sendLoggedError(session *sessionContext, taskID, taskType, code, message string, cause error, upstreamPayload string) {
-	log.Printf("vbe %s", strings.Join(compactErrorParts(taskType, session.sessionID, taskID, code, message, cause, upstreamPayload), " "))
+	attrs := []slog.Attr{
+		slog.String("component", taskType),
+		slog.String("session_id", session.sessionID),
+		slog.String("task_id", taskID),
+		slog.String("code", code),
+		slog.String("message", message),
+	}
+	if cause != nil {
+		attrs = append(attrs, slog.String("cause", cause.Error()))
+	}
+	if strings.TrimSpace(upstreamPayload) != "" {
+		attrs = append(attrs, slog.Int("upstream_payload_bytes", len(upstreamPayload)))
+	}
+	slog.LogAttrs(context.Background(), slog.LevelError, "voice.error", attrs...)
 	h.sendError(session, taskID, code, message)
 }
 
-func (h *Handler) logSessionEvent(session *sessionContext, event string, fields ...string) {
-	baseFields := append([]string{detailField("remote_addr", session.remoteAddr)}, fields...)
+func (h *Handler) logSessionEvent(session *sessionContext, event string, fields ...slog.Attr) {
+	baseFields := append([]slog.Attr{slog.String("remote_addr", session.remoteAddr)}, fields...)
 	if h.app.Asr.WebSocketDetailedLogEnabled {
 		h.logTaskEvent("asr", session.sessionID, "", event, baseFields...)
 	}
@@ -923,25 +934,19 @@ func (h *Handler) logSessionEvent(session *sessionContext, event string, fields 
 	}
 }
 
-func (h *Handler) logTaskEvent(taskType, sessionID, taskID, event string, fields ...string) {
+func (h *Handler) logTaskEvent(taskType, sessionID, taskID, event string, attrs ...slog.Attr) {
 	if !h.shouldLogDetailed(taskType) {
 		return
 	}
-	parts := []string{
-		detailField("component", taskType),
-		detailField("session_id", sessionID),
-		detailField("task_id", taskID),
-		detailField("event", event),
+	base := []slog.Attr{
+		slog.String("component", taskType),
+		slog.String("session_id", sessionID),
 	}
-	parts = append(parts, fields...)
-	filtered := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if strings.TrimSpace(part) == "" {
-			continue
-		}
-		filtered = append(filtered, part)
+	if strings.TrimSpace(taskID) != "" {
+		base = append(base, slog.String("task_id", taskID))
 	}
-	log.Printf("vbd %s", strings.Join(filtered, " "))
+	base = append(base, attrs...)
+	slog.LogAttrs(context.Background(), slog.LevelInfo, event, filterEmptyAttrs(base)...)
 }
 
 func (h *Handler) shouldLogDetailed(taskType string) bool {
@@ -1415,212 +1420,23 @@ func compactVoiceDisplayName(voiceID, displayName string) string {
 	return displayName
 }
 
-func detailField(key string, value any) string {
-	compactKey := compactFieldKey(key)
-	if compactKey == "" {
-		return ""
+// detailField 是日志字段构造的轻量包装，所有调用点都通过它拼接 slog.Attr，
+// 让现有的代码路径不需要随 logger 实现切换而大改。空 string 值会返回零值
+// slog.Attr，logTaskEvent 会过滤掉，避免输出 voice_display_name="" 这种噪音。
+func detailField(key string, value any) slog.Attr {
+	if s, ok := value.(string); ok && strings.TrimSpace(s) == "" {
+		return slog.Attr{}
 	}
-	switch typed := value.(type) {
-	case string:
-		normalized := normalizeFieldValue(key, typed)
-		if normalized == "" {
-			return ""
-		}
-		return fmt.Sprintf("%s=%s", compactKey, formatCompactString(normalized))
-	case int:
-		return fmt.Sprintf("%s=%d", compactKey, typed)
-	case int64:
-		return fmt.Sprintf("%s=%d", compactKey, typed)
-	case float64:
-		return fmt.Sprintf("%s=%g", compactKey, typed)
-	case bool:
-		return fmt.Sprintf("%s=%t", compactKey, typed)
-	default:
-		return fmt.Sprintf("%s=%v", compactKey, typed)
-	}
+	return slog.Any(key, value)
 }
 
-func compactFieldKey(key string) string {
-	switch key {
-	case "component":
-		return "c"
-	case "session_id":
-		return "sid"
-	case "task_id":
-		return "tid"
-	case "event":
-		return "ev"
-	case "mode":
-		return "m"
-	case "voice":
-		return "v"
-	case "voice_display_name":
-		return "vd"
-	case "speech_rate", "sample_rate":
-		return "sr"
-	case "input_mode":
-		return "im"
-	case "channels":
-		return "ch"
-	case "text":
-		return "txt"
-	case "chat_id":
-		return "cid"
-	case "agent_key":
-		return "ak"
-	case "seq":
-		return "seq"
-	case "audio_bytes":
-		return "ab"
-	case "payload_bytes":
-		return "pb"
-	case "audio_base64_chars":
-		return "b64"
-	case "language":
-		return "lang"
-	case "turn_detection":
-		return "td"
-	case "upstream_type":
-		return "ut"
-	case "reason":
-		return "rsn"
-	case "code":
-		return "cd"
-	case "message":
-		return "msg"
-	case "cause":
-		return "cause"
-	case "upstream_payload_bytes":
-		return "upb"
-	case "remote_addr":
-		return "ra"
-	default:
-		return key
-	}
-}
-
-func normalizeFieldValue(key, value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	switch key {
-	case "session_id":
-		return strings.TrimPrefix(value, "ws-session-")
-	case "event":
-		return compactEventCode(value)
-	default:
-		return value
-	}
-}
-
-func compactEventCode(event string) string {
-	switch event {
-	case "connection.open":
-		return "co"
-	case "connection.closed":
-		return "cc"
-	case "tts.start":
-		return "st"
-	case "tts.start.meta":
-		return "meta"
-	case "task.started":
-		return "ts"
-	case "tts.audio.format":
-		return "fmt"
-	case "tts.text.delta":
-		return "txt"
-	case "tts.chat.updated":
-		return "chat"
-	case "tts.audio.chunk":
-		return "chk"
-	case "tts.done":
-		return "done"
-	case "tts.stop":
-		return "stop"
-	case "task.stopped":
-		return "te"
-	case "asr.start":
-		return "st"
-	case "asr.audio.append":
-		return "app"
-	case "asr.audio.commit":
-		return "cmt"
-	case "asr.text.delta":
-		return "txt"
-	case "asr.text.final":
-		return "fin"
-	case "asr.speech.started":
-		return "sp"
-	case "asr.stop":
-		return "stop"
-	case "upstream.connected":
-		return "up"
-	case "upstream.closed":
-		return "upc"
-	case "upstream.error", "upstream.connect_failed":
-		return "upe"
-	case "error":
-		return "err"
-	default:
-		return event
-	}
-}
-
-func formatCompactString(value string) string {
-	if isCompactToken(value) {
-		return value
-	}
-	return strconv.Quote(value)
-}
-
-func isCompactToken(value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+func filterEmptyAttrs(attrs []slog.Attr) []slog.Attr {
+	out := make([]slog.Attr, 0, len(attrs))
+	for _, a := range attrs {
+		if a.Key == "" {
 			continue
 		}
-		switch r {
-		case '.', '-', '_', ':', '/':
-			continue
-		default:
-			return false
-		}
+		out = append(out, a)
 	}
-	return true
-}
-
-func compactErrorParts(taskType, sessionID, taskID, code, message string, cause error, upstreamPayload string) []string {
-	parts := []string{
-		detailField("component", taskType),
-		detailField("session_id", sessionID),
-		detailField("task_id", taskID),
-		detailField("event", "error"),
-		detailField("code", code),
-		detailField("message", message),
-	}
-	if cause != nil {
-		parts = append(parts, detailField("cause", cause.Error()))
-	}
-	if strings.TrimSpace(upstreamPayload) != "" {
-		parts = append(parts, detailField("upstream_payload_bytes", len(upstreamPayload)))
-	}
-	filtered := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if strings.TrimSpace(part) == "" {
-			continue
-		}
-		filtered = append(filtered, part)
-	}
-	return filtered
-}
-
-func classifyTransportError(err error) int {
-	var closeErr *websocket.CloseError
-	if errors.As(err, &closeErr) {
-		return closeErr.Code
-	}
-	return websocket.CloseInternalServerErr
+	return out
 }

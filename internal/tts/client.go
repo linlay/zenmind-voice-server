@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -292,10 +292,10 @@ func (s *dashScopeTtsStreamSession) run() {
 		case "error":
 			code, message := parseRealtimeTTSError(event)
 			if strings.TrimSpace(message) == "" {
-				log.Printf("tts upstream error payload_bytes=%d", len(payload))
+				slog.Warn("tts upstream error", "component", "tts", "payload_bytes", len(payload))
 				message = "Realtime TTS upstream returned error"
 			} else if strings.TrimSpace(code) != "" {
-				log.Printf("tts upstream error code=%q message=%q", code, message)
+				slog.Warn("tts upstream error", "component", "tts", "code", code, "message", message)
 			}
 			s.fail(errors.New(message))
 			return

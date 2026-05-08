@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,9 +20,12 @@ import (
 )
 
 func main() {
+	setupLogging()
+
 	cfg, err := config.Load(".")
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		slog.Error("load config failed", "err", err)
+		os.Exit(1)
 	}
 
 	asrProbe := health.New()
@@ -48,7 +52,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("voice server listening on %s", server.Addr)
+		slog.Info("voice server listening", "addr", server.Addr)
 		if serveErr := server.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			errCh <- serveErr
 		}
@@ -59,15 +63,16 @@ func main() {
 
 	select {
 	case serveErr := <-errCh:
-		log.Fatalf("server failed: %v", serveErr)
+		slog.Error("server failed", "err", serveErr)
+		os.Exit(1)
 	case <-stopCh:
-		log.Printf("voice server received stop signal, draining")
+		slog.Info("voice server received stop signal, draining")
 	}
 
 	// 先给 WS 客户端 3 秒 drain 时间（发 connection.draining，让客户端主动断开重连）
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	if err := wsHandler.Shutdown(drainCtx); err != nil && err != context.DeadlineExceeded {
-		log.Printf("ws drain: %v", err)
+		slog.Warn("ws drain failed", "err", err)
 	}
 	drainCancel()
 
@@ -75,6 +80,22 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("server shutdown: %v", err)
+		slog.Warn("server shutdown failed", "err", err)
 	}
+}
+
+func setupLogging() {
+	level := slog.LevelInfo
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_VOICE_LOG_LEVEL")), "debug") {
+		level = slog.LevelDebug
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_VOICE_LOG_FORMAT"))) {
+	case "json":
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	default:
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(handler))
 }

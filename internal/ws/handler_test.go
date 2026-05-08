@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -653,12 +653,11 @@ func TestAsrDetailedLogsEnabled(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool {
 		logs := logBuffer.String()
-		return strings.Contains(logs, `vbd c=asr`) &&
-			strings.Contains(logs, `ev=st`) &&
-			strings.Contains(logs, `ab=3`) &&
-			strings.Contains(logs, `ev=fin`) &&
-			strings.Contains(logs, `txt="你好世界"`) &&
-			!strings.Contains(logs, `sid=ws-session-`)
+		return strings.Contains(logs, `component=asr`) &&
+			strings.Contains(logs, `msg=asr.start`) &&
+			strings.Contains(logs, `audio_bytes=3`) &&
+			strings.Contains(logs, `msg=asr.text.final`) &&
+			strings.Contains(logs, `text=你好世界`)
 	})
 	_ = conn.Close()
 	server.Close()
@@ -692,10 +691,10 @@ func TestAsrDetailedLogsDisabled(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	logs := logBuffer.String()
-	if strings.Contains(logs, `vbd c=asr`) ||
-		strings.Contains(logs, `ev=st`) ||
-		strings.Contains(logs, `ev=app`) ||
-		strings.Contains(logs, `ev=fin`) {
+	if strings.Contains(logs, `component=asr`) ||
+		strings.Contains(logs, `msg=asr.start`) ||
+		strings.Contains(logs, `msg=asr.audio.append`) ||
+		strings.Contains(logs, `msg=asr.text.final`) {
 		t.Fatalf("expected no ASR detail logs, got %s", logBuffer.String())
 	}
 	_ = conn.Close()
@@ -732,15 +731,23 @@ func TestLocalTtsDetailedLogsEnabled(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool {
 		logs := logBuffer.String()
-		return strings.Contains(logs, `vbd c=tts`) &&
-			strings.Contains(logs, `ev=st m=local im=single v=Cherry sr=1.5 txt="hello log"`) &&
-			strings.Contains(logs, `ev=fmt sr=24000 ch=1 v=Cherry`) &&
-			!strings.Contains(logs, `vd=`) &&
-			strings.Contains(logs, `ev=chk seq=1 ab=4`) &&
-			strings.Contains(logs, `ev=done`) &&
-			!strings.Contains(logs, `cid=`) &&
-			!strings.Contains(logs, `ak=`) &&
-			!strings.Contains(logs, `sid=ws-session-`)
+		return strings.Contains(logs, `component=tts`) &&
+			strings.Contains(logs, `msg=tts.start`) &&
+			strings.Contains(logs, `mode=local`) &&
+			strings.Contains(logs, `input_mode=single`) &&
+			strings.Contains(logs, `voice=Cherry`) &&
+			strings.Contains(logs, `speech_rate=1.5`) &&
+			strings.Contains(logs, `text="hello log"`) &&
+			strings.Contains(logs, `msg=tts.audio.format`) &&
+			strings.Contains(logs, `sample_rate=24000`) &&
+			strings.Contains(logs, `channels=1`) &&
+			!strings.Contains(logs, `voice_display_name=`) &&
+			strings.Contains(logs, `msg=tts.audio.chunk`) &&
+			strings.Contains(logs, `seq=1`) &&
+			strings.Contains(logs, `audio_bytes=4`) &&
+			strings.Contains(logs, `msg=tts.done`) &&
+			!strings.Contains(logs, `chat_id=`) &&
+			!strings.Contains(logs, `agent_key=`)
 	})
 	_ = conn.Close()
 	server.Close()
@@ -779,11 +786,16 @@ func TestLlmTtsDetailedLogsEnabled(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool {
 		logs := logBuffer.String()
-		return strings.Contains(logs, `vbd c=tts`) &&
-			strings.Contains(logs, `ev=st m=llm im=single v=Cherry sr=1.2 txt=summarize ak=demo`) &&
-			!strings.Contains(logs, `ev=st m=llm im=single v=Cherry sr=1.2 txt=summarize cid=`) &&
-			strings.Contains(logs, `ev=chat cid=chat-log`) &&
-			strings.Contains(logs, `ev=txt txt="你好"`)
+		return strings.Contains(logs, `component=tts`) &&
+			strings.Contains(logs, `msg=tts.start`) &&
+			strings.Contains(logs, `mode=llm`) &&
+			strings.Contains(logs, `voice=Cherry`) &&
+			strings.Contains(logs, `text=summarize`) &&
+			strings.Contains(logs, `agent_key=demo`) &&
+			strings.Contains(logs, `msg=tts.chat.updated`) &&
+			strings.Contains(logs, `chat_id=chat-log`) &&
+			strings.Contains(logs, `msg=tts.text.delta`) &&
+			strings.Contains(logs, `text=你好`)
 	})
 	_ = conn.Close()
 	server.Close()
@@ -1074,15 +1086,9 @@ func (b *safeBuffer) String() string {
 
 func captureStandardLogger(t *testing.T, buffer *safeBuffer) func() {
 	t.Helper()
-	originalWriter := log.Writer()
-	originalFlags := log.Flags()
-	originalPrefix := log.Prefix()
-	log.SetOutput(buffer)
-	log.SetFlags(0)
-	log.SetPrefix("")
+	original := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buffer, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return func() {
-		log.SetOutput(originalWriter)
-		log.SetFlags(originalFlags)
-		log.SetPrefix(originalPrefix)
+		slog.SetDefault(original)
 	}
 }
