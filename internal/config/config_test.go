@@ -15,6 +15,9 @@ func TestApplyEnvLoadsRequiredVoiceConfig(t *testing.T) {
 	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_OPEN_HOLD_MS", "150")
 	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_CLOSE_HOLD_MS", "600")
 	t.Setenv("APP_VOICE_ASR_CLIENT_GATE_PRE_ROLL_MS", "180")
+	t.Setenv("APP_VOICE_ASR_TURN_DETECTION_THRESHOLD", "0.6")
+	t.Setenv("APP_VOICE_ASR_TURN_DETECTION_SILENCE_DURATION_MS", "900")
+	t.Setenv("APP_VOICE_ASR_TURN_DETECTION_PREFIX_PADDING_MS", "360")
 
 	cfg := defaults()
 	if err := applyEnv(cfg); err != nil {
@@ -63,6 +66,15 @@ func TestApplyEnvLoadsRequiredVoiceConfig(t *testing.T) {
 	if cfg.Asr.ClientGate.PreRollMs != 180 {
 		t.Fatalf("unexpected client gate pre-roll: %d", cfg.Asr.ClientGate.PreRollMs)
 	}
+	if cfg.Asr.TurnDetection.Threshold != 0.6 {
+		t.Fatalf("unexpected turn detection threshold: %v", cfg.Asr.TurnDetection.Threshold)
+	}
+	if cfg.Asr.TurnDetection.SilenceDurationMs != 900 {
+		t.Fatalf("unexpected turn detection silence duration: %d", cfg.Asr.TurnDetection.SilenceDurationMs)
+	}
+	if cfg.Asr.TurnDetection.PrefixPaddingMs != 360 {
+		t.Fatalf("unexpected turn detection prefix padding: %d", cfg.Asr.TurnDetection.PrefixPaddingMs)
+	}
 }
 
 func TestApplyEnvLeavesDetailedLogsDisabledByDefault(t *testing.T) {
@@ -82,17 +94,26 @@ func TestApplyEnvLeavesDetailedLogsDisabledByDefault(t *testing.T) {
 	if !cfg.Asr.ClientGate.Enabled {
 		t.Fatal("expected ASR client gate to default to enabled")
 	}
-	if cfg.Asr.ClientGate.RMSThreshold != 0.008 {
+	if cfg.Asr.ClientGate.RMSThreshold != 0.012 {
 		t.Fatalf("unexpected default client gate threshold: %v", cfg.Asr.ClientGate.RMSThreshold)
 	}
-	if cfg.Asr.ClientGate.OpenHoldMs != 120 {
+	if cfg.Asr.ClientGate.OpenHoldMs != 200 {
 		t.Fatalf("unexpected default client gate open hold: %d", cfg.Asr.ClientGate.OpenHoldMs)
 	}
-	if cfg.Asr.ClientGate.CloseHoldMs != 480 {
+	if cfg.Asr.ClientGate.CloseHoldMs != 700 {
 		t.Fatalf("unexpected default client gate close hold: %d", cfg.Asr.ClientGate.CloseHoldMs)
 	}
 	if cfg.Asr.ClientGate.PreRollMs != 240 {
 		t.Fatalf("unexpected default client gate pre-roll: %d", cfg.Asr.ClientGate.PreRollMs)
+	}
+	if cfg.Asr.TurnDetection.Threshold != 0.5 {
+		t.Fatalf("unexpected default turn detection threshold: %v", cfg.Asr.TurnDetection.Threshold)
+	}
+	if cfg.Asr.TurnDetection.SilenceDurationMs != 700 {
+		t.Fatalf("unexpected default turn detection silence duration: %d", cfg.Asr.TurnDetection.SilenceDurationMs)
+	}
+	if cfg.Asr.TurnDetection.PrefixPaddingMs != 300 {
+		t.Fatalf("unexpected default turn detection prefix padding: %d", cfg.Asr.TurnDetection.PrefixPaddingMs)
 	}
 }
 

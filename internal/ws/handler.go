@@ -281,7 +281,7 @@ func (h *Handler) handleAsrStart(session *sessionContext, event clientEvent) {
 		pendingClientEvents:    make([]queuedEvent, 0, 8),
 		seenUpstreamEventTypes: make(map[string]struct{}),
 	}
-	task.turnDetectionPayload = buildAsrSessionUpdatePayload(event.TurnDetection, task.sampleRate, task.language)
+	task.turnDetectionPayload = buildAsrSessionUpdatePayload(h.app.Asr.TurnDetection.Normalized(), event.TurnDetection, task.sampleRate, task.language)
 	session.setAsrTask(taskID, task)
 	h.logTaskEvent("asr", session.sessionID, taskID, "asr.start",
 		detailField("sample_rate", task.sampleRate),
@@ -568,8 +568,8 @@ func (h *Handler) connectUpstream(session *sessionContext, task *asrTask) {
 
 func (h *Handler) startTtsTask(session *sessionContext, task *ttsTask) {
 	session.sendJSON(eventBody("task.started", session.sessionID, task.taskID, map[string]any{
-		"taskType": "tts",
-		"mode":     task.mode,
+		"taskType":  "tts",
+		"mode":      task.mode,
 		"inputMode": task.inputMode,
 	}))
 	h.logTaskEvent("tts", session.sessionID, task.taskID, "task.started")
@@ -1251,11 +1251,14 @@ func eventBody(eventType, sessionID, taskID string, extras map[string]any) map[s
 	return body
 }
 
-func buildAsrSessionUpdatePayload(raw json.RawMessage, sampleRate int, language string) string {
+func buildAsrSessionUpdatePayload(defaults config.TurnDetectionProperties, raw json.RawMessage, sampleRate int, language string) string {
 	turnDetection := map[string]any{
-		"type":                "server_vad",
-		"threshold":           0.0,
-		"silence_duration_ms": 400,
+		"type":                defaults.Type,
+		"threshold":           defaults.Threshold,
+		"silence_duration_ms": defaults.SilenceDurationMs,
+	}
+	if defaults.PrefixPaddingMs > 0 {
+		turnDetection["prefix_padding_ms"] = defaults.PrefixPaddingMs
 	}
 	if len(raw) > 0 {
 		var input map[string]any

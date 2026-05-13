@@ -60,6 +60,7 @@ func (a *API) Register(mux *http.ServeMux) {
 
 func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
 	clientGate := a.app.Asr.ClientGate.Normalized()
+	turnDetection := a.app.Asr.TurnDetection.Normalized()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"websocketPath": "/api/voice/ws",
 		"asr": map[string]any{
@@ -75,9 +76,10 @@ func (a *API) capabilities(w http.ResponseWriter, _ *http.Request) {
 					"preRollMs":    clientGate.PreRollMs,
 				},
 				"turnDetection": map[string]any{
-					"type":              "server_vad",
-					"threshold":         0,
-					"silenceDurationMs": 400,
+					"type":              turnDetection.Type,
+					"threshold":         turnDetection.Threshold,
+					"silenceDurationMs": turnDetection.SilenceDurationMs,
+					"prefixPaddingMs":   turnDetection.PrefixPaddingMs,
 				},
 			},
 		},
@@ -162,9 +164,9 @@ func (a *API) readiness(w http.ResponseWriter, _ *http.Request) {
 }
 
 type upstreamEval struct {
-	healthy   bool
+	healthy    bool
 	configured bool
-	reason    string
+	reason     string
 }
 
 func evaluateUpstream(configured bool, probe *health.ConnectProbe) upstreamEval {

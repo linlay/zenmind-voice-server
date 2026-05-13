@@ -31,6 +31,7 @@ type WSProperties struct {
 
 type AsrProperties struct {
 	ClientGate                  ClientGateProperties
+	TurnDetection               TurnDetectionProperties
 	Realtime                    RealtimeProxyProperties
 	WebSocketDetailedLogEnabled bool
 }
@@ -41,6 +42,13 @@ type ClientGateProperties struct {
 	OpenHoldMs   int
 	CloseHoldMs  int
 	PreRollMs    int
+}
+
+type TurnDetectionProperties struct {
+	Type              string
+	Threshold         float64
+	SilenceDurationMs int
+	PrefixPaddingMs   int
 }
 
 type TtsProperties struct {
@@ -118,10 +126,16 @@ func defaults() *App {
 		Asr: AsrProperties{
 			ClientGate: ClientGateProperties{
 				Enabled:      true,
-				RMSThreshold: 0.008,
-				OpenHoldMs:   120,
-				CloseHoldMs:  480,
+				RMSThreshold: 0.012,
+				OpenHoldMs:   200,
+				CloseHoldMs:  700,
 				PreRollMs:    240,
+			},
+			TurnDetection: TurnDetectionProperties{
+				Type:              "server_vad",
+				Threshold:         0.5,
+				SilenceDurationMs: 700,
+				PrefixPaddingMs:   300,
 			},
 			Realtime: RealtimeProxyProperties{
 				ConnectTimeoutMs:       10000,
@@ -172,6 +186,10 @@ func applyEnv(cfg *App) error {
 	cfg.Asr.ClientGate.OpenHoldMs = envInt("APP_VOICE_ASR_CLIENT_GATE_OPEN_HOLD_MS", cfg.Asr.ClientGate.OpenHoldMs)
 	cfg.Asr.ClientGate.CloseHoldMs = envInt("APP_VOICE_ASR_CLIENT_GATE_CLOSE_HOLD_MS", cfg.Asr.ClientGate.CloseHoldMs)
 	cfg.Asr.ClientGate.PreRollMs = envInt("APP_VOICE_ASR_CLIENT_GATE_PRE_ROLL_MS", cfg.Asr.ClientGate.PreRollMs)
+	cfg.Asr.TurnDetection.Type = envString("APP_VOICE_ASR_TURN_DETECTION_TYPE", cfg.Asr.TurnDetection.Type)
+	cfg.Asr.TurnDetection.Threshold = envFloat("APP_VOICE_ASR_TURN_DETECTION_THRESHOLD", cfg.Asr.TurnDetection.Threshold)
+	cfg.Asr.TurnDetection.SilenceDurationMs = envInt("APP_VOICE_ASR_TURN_DETECTION_SILENCE_DURATION_MS", cfg.Asr.TurnDetection.SilenceDurationMs)
+	cfg.Asr.TurnDetection.PrefixPaddingMs = envInt("APP_VOICE_ASR_TURN_DETECTION_PREFIX_PADDING_MS", cfg.Asr.TurnDetection.PrefixPaddingMs)
 	cfg.Asr.WebSocketDetailedLogEnabled = envBool("APP_VOICE_ASR_WS_DETAILED_LOG_ENABLED", cfg.Asr.WebSocketDetailedLogEnabled)
 
 	cfg.Tts.DefaultMode = envString("APP_VOICE_TTS_DEFAULT_MODE", cfg.Tts.DefaultMode)
@@ -302,6 +320,23 @@ func (c ClientGateProperties) Normalized() ClientGateProperties {
 		c.PreRollMs = defaults.PreRollMs
 	}
 	return c
+}
+
+func (t TurnDetectionProperties) Normalized() TurnDetectionProperties {
+	defaults := defaults().Asr.TurnDetection
+	if strings.TrimSpace(t.Type) == "" {
+		t.Type = defaults.Type
+	}
+	if t.Threshold <= 0 {
+		t.Threshold = defaults.Threshold
+	}
+	if t.SilenceDurationMs <= 0 {
+		t.SilenceDurationMs = defaults.SilenceDurationMs
+	}
+	if t.PrefixPaddingMs <= 0 {
+		t.PrefixPaddingMs = defaults.PrefixPaddingMs
+	}
+	return t
 }
 
 func (w WSProperties) IsOriginAllowed(origin string) bool {

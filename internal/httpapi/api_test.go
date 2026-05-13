@@ -39,17 +39,27 @@ func TestCapabilities(t *testing.T) {
 	if clientGate["enabled"] != true {
 		t.Fatalf("expected client gate enabled, got %#v", clientGate["enabled"])
 	}
-	if clientGate["rmsThreshold"] != 0.008 {
+	if clientGate["rmsThreshold"] != 0.012 {
 		t.Fatalf("unexpected client gate threshold: %#v", clientGate["rmsThreshold"])
 	}
-	if clientGate["openHoldMs"] != float64(120) {
+	if clientGate["openHoldMs"] != float64(200) {
 		t.Fatalf("unexpected client gate openHoldMs: %#v", clientGate["openHoldMs"])
 	}
-	if clientGate["closeHoldMs"] != float64(480) {
+	if clientGate["closeHoldMs"] != float64(700) {
 		t.Fatalf("unexpected client gate closeHoldMs: %#v", clientGate["closeHoldMs"])
 	}
 	if clientGate["preRollMs"] != float64(240) {
 		t.Fatalf("unexpected client gate preRollMs: %#v", clientGate["preRollMs"])
+	}
+	turnDetection := defaults["turnDetection"].(map[string]any)
+	if turnDetection["threshold"] != 0.5 {
+		t.Fatalf("unexpected turn detection threshold: %#v", turnDetection["threshold"])
+	}
+	if turnDetection["silenceDurationMs"] != float64(700) {
+		t.Fatalf("unexpected turn detection silenceDurationMs: %#v", turnDetection["silenceDurationMs"])
+	}
+	if turnDetection["prefixPaddingMs"] != float64(300) {
+		t.Fatalf("unexpected turn detection prefixPaddingMs: %#v", turnDetection["prefixPaddingMs"])
 	}
 	ttsPayload := payload["tts"].(map[string]any)
 	if ttsPayload["streamInput"] != true {
@@ -175,10 +185,14 @@ func configTestApp() *config.App {
 	}
 	app.Asr.Realtime.APIKey = "sk-asr"
 	app.Asr.ClientGate.Enabled = true
-	app.Asr.ClientGate.RMSThreshold = 0.008
-	app.Asr.ClientGate.OpenHoldMs = 120
-	app.Asr.ClientGate.CloseHoldMs = 480
+	app.Asr.ClientGate.RMSThreshold = 0.012
+	app.Asr.ClientGate.OpenHoldMs = 200
+	app.Asr.ClientGate.CloseHoldMs = 700
 	app.Asr.ClientGate.PreRollMs = 240
+	app.Asr.TurnDetection.Type = "server_vad"
+	app.Asr.TurnDetection.Threshold = 0.5
+	app.Asr.TurnDetection.SilenceDurationMs = 700
+	app.Asr.TurnDetection.PrefixPaddingMs = 300
 	app.Tts.DefaultMode = "local"
 	app.Tts.Local.APIKey = "sk-tts"
 	app.Tts.Local.ResponseFormat = "pcm"

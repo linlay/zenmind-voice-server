@@ -64,6 +64,7 @@ type CapabilitiesResponse = {
         type?: string;
         threshold?: number;
         silenceDurationMs?: number;
+        prefixPaddingMs?: number;
       };
     };
   };
@@ -109,9 +110,9 @@ const QA_SEND_PAUSE_MAX_SECONDS = 10.0;
 const QA_READY_CUE_DELAY_MS = 300;
 const DEFAULT_CLIENT_GATE: ClientGateConfig = {
   enabled: true,
-  rmsThreshold: 0.008,
-  openHoldMs: 120,
-  closeHoldMs: 480,
+  rmsThreshold: 0.012,
+  openHoldMs: 200,
+  closeHoldMs: 700,
   preRollMs: 240
 };
 const TEST_ASR_TASK_ID = 'asr-test';
@@ -397,6 +398,10 @@ function qaStatusClass(status: QaStatus): string {
 
 function isTaskActive(status: Status): boolean {
   return status === 'CONNECTING' || status === 'STREAMING';
+}
+
+function isRecoverableQaAsrStopReason(reason?: string): boolean {
+  return reason === 'upstream_finished' || reason === 'upstream_closed';
 }
 
 function formatByteSize(bytes: number): string {
@@ -919,6 +924,16 @@ export default function App() {
           delete asrClientGateConfigsRef.current[QA_ASR_TASK_ID];
           cancelQaListeningTransition();
           clearQaPendingUtterance();
+          if (qaSessionActiveRef.current && isRecoverableQaAsrStopReason(message.reason)) {
+            if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
+              resetAllAudioCaptureState();
+            }
+            qaAwaitingUserRef.current = false;
+            setQaAsrStatusValue('CONNECTING');
+            appendQaLog(`[ASR reconnect] ${message.reason}`);
+            startQaAsrTask();
+            return;
+          }
           resetQaChatContext();
           if (captureTaskIdRef.current === QA_ASR_TASK_ID) {
             resetAllAudioCaptureState();
@@ -1221,8 +1236,9 @@ export default function App() {
       clientGate,
       turnDetection: {
         type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
-        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,
-        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 400
+        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0.5,
+        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 700,
+        prefixPaddingMs: capabilities?.asr?.defaults?.turnDetection?.prefixPaddingMs ?? 300
       }
     });
   }
@@ -1307,6 +1323,30 @@ export default function App() {
     }
   }
 
+  function startQaAsrTask(): boolean {
+    const clientGate = resolveTaskClientGateConfig();
+    asrClientGateConfigsRef.current[QA_ASR_TASK_ID] = clientGate;
+
+    const sent = sendJson({
+      type: 'asr.start',
+      taskId: QA_ASR_TASK_ID,
+      sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
+      language: capabilities?.asr?.defaults?.language ?? 'zh',
+      clientGate,
+      turnDetection: {
+        type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
+        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0.5,
+        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 700,
+        prefixPaddingMs: capabilities?.asr?.defaults?.turnDetection?.prefixPaddingMs ?? 300
+      }
+    });
+
+    if (!sent) {
+      delete asrClientGateConfigsRef.current[QA_ASR_TASK_ID];
+    }
+    return sent;
+  }
+
   function startQa() {
     if (connectionStatus !== 'OPEN') {
       setQaError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
@@ -1335,22 +1375,8 @@ export default function App() {
     qaAwaitingUserRef.current = false;
     setQaAsrStatusValue('CONNECTING');
     setQaTtsStatusValue('READY');
-    const clientGate = resolveTaskClientGateConfig();
-    asrClientGateConfigsRef.current[QA_ASR_TASK_ID] = clientGate;
 
-    const sent = sendJson({
-      type: 'asr.start',
-      taskId: QA_ASR_TASK_ID,
-      sampleRate: capabilities?.asr?.defaults?.sampleRate ?? 16000,
-      language: capabilities?.asr?.defaults?.language ?? 'zh',
-      clientGate,
-      turnDetection: {
-        type: capabilities?.asr?.defaults?.turnDetection?.type ?? 'server_vad',
-        threshold: capabilities?.asr?.defaults?.turnDetection?.threshold ?? 0,
-        silenceDurationMs: capabilities?.asr?.defaults?.turnDetection?.silenceDurationMs ?? 400
-      }
-    });
-    if (!sent) {
+    if (!startQaAsrTask()) {
       setQaError('WebSocket 尚未连接，请先等待连接建立或手动重连。');
       setQaStatusValue('ERROR');
       setQaSessionActiveValue(false);

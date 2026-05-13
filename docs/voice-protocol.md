@@ -30,15 +30,16 @@
       "language": "zh",
       "clientGate": {
         "enabled": true,
-        "rmsThreshold": 0.008,
-        "openHoldMs": 120,
-        "closeHoldMs": 480,
+        "rmsThreshold": 0.012,
+        "openHoldMs": 200,
+        "closeHoldMs": 700,
         "preRollMs": 240
       },
       "turnDetection": {
         "type": "server_vad",
-        "threshold": 0,
-        "silenceDurationMs": 400
+        "threshold": 0.5,
+        "silenceDurationMs": 700,
+        "prefixPaddingMs": 300
       }
     }
   },
@@ -149,15 +150,16 @@
   "language": "zh",
   "clientGate": {
     "enabled": true,
-    "rmsThreshold": 0.008,
-    "openHoldMs": 120,
-    "closeHoldMs": 480,
+    "rmsThreshold": 0.012,
+    "openHoldMs": 200,
+    "closeHoldMs": 700,
     "preRollMs": 240
   },
   "turnDetection": {
     "type": "server_vad",
-    "threshold": 0,
-    "silenceDurationMs": 400
+    "threshold": 0.5,
+    "silenceDurationMs": 700,
+    "prefixPaddingMs": 300
   }
 }
 ```
